@@ -22,6 +22,7 @@ import json
 import os
 import re
 import sys
+from collections import Counter
 from pathlib import Path
 from typing import Optional
 
@@ -111,7 +112,6 @@ class TMLDParser:
                 if role:
                     self._roles.append(role)
 
-        # Shared Power Query expressions/functions (expressions.tmdl)
         expr_file = self.definition_dir / "expressions.tmdl"
         if expr_file.exists():
             self._shared_expressions = self._parse_expressions_tmdl(expr_file)
@@ -129,7 +129,6 @@ class TMLDParser:
         table: dict = {"name": "", "columns": [], "measures": [], "partitions": []}
         i = 0
 
-        # First non-empty line should be: table <name>
         while i < len(lines) and not lines[i].strip():
             i += 1
         if i >= len(lines):
@@ -160,56 +159,82 @@ class TMLDParser:
             line = lines[i]
             stripped = line.strip()
 
-            # Detect new top-level blocks (indented 1 level under table)
             if stripped.startswith("measure ") and line.startswith("\t") and not line.startswith("\t\t"):
                 flush_block()
                 current_type = "measure"
-                current_name = stripped[8:].split("=")[0].strip()
-                current_block = [stripped]
+                # Strip optional quotes from name: 'My Measure' = ... → My Measure
+                raw_name = stripped[8:].split("=")[0].strip().strip("'")
+                current_name = raw_name
+                current_block = [line]  # pass raw line so indentation is preserved
             elif stripped.startswith("column ") and line.startswith("\t") and not line.startswith("\t\t"):
                 flush_block()
                 current_type = "column"
-                current_name = stripped[7:].strip()
-                current_block = [stripped]
+                current_name = stripped[7:].strip().strip("'")
+                current_block = [line]
             elif stripped.startswith("partition ") and line.startswith("\t") and not line.startswith("\t\t"):
                 flush_block()
                 current_type = "partition"
-                current_name = stripped[10:].strip()
-                current_block = [stripped]
+                current_name = stripped[10:].strip().strip("'")
+                current_block = [line]
             elif current_type:
-                current_block.append(stripped)
+                current_block.append(line)  # preserve raw indentation
             i += 1
 
         flush_block()
         return table
 
     def _parse_measure_block(self, name: str, block: list[str]) -> dict:
+        """
+        Parse a measure block from raw TMDL lines (indentation preserved).
+
+        TMDL layout:
+            \\tmeasure 'Name' =
+            \\t\\t\\tDAX line 1
+            \\t\\t\\tDAX line 2
+            \\t\\tformatString: 0
+            \\t\\tlineageTag: ...
+
+        DAX body follows the header until first sibling property at double-tab level.
+        """
         dax_lines: list[str] = []
         description = ""
         format_string = ""
-        in_expression = False
+
+        SIBLING_PROPS = (
+            "formatString:", "lineageTag:", "description:", "displayFolder:",
+            "annotation ", "isHidden:", "kpiStatusType:", "dataCategory:",
+        )
+
+        in_dax = False
 
         for line in block:
-            if line.startswith("measure "):
-                # Inline expression: measure Name = <expr>
-                parts = line.split("=", 1)
-                if len(parts) == 2 and parts[1].strip():
-                    dax_lines.append(parts[1].strip())
-            elif line.strip().startswith("expression:"):
-                in_expression = True
-                rest = line.split(":", 1)[1].strip().strip("`")
-                if rest:
-                    dax_lines.append(rest)
-            elif in_expression and (line.startswith("\t\t") or line.startswith("  ")):
-                dax_lines.append(line.strip().strip("`"))
-            elif line.strip().startswith("description:"):
-                in_expression = False
-                description = line.split(":", 1)[1].strip().strip("'\"")
-            elif line.strip().startswith("formatString:"):
-                in_expression = False
-                format_string = line.split(":", 1)[1].strip().strip("'\"")
-            else:
-                in_expression = False
+            stripped = line.strip()
+
+            if stripped.startswith("measure ") and "=" in stripped:
+                parts = stripped.split("=", 1)
+                inline = parts[1].strip() if len(parts) == 2 else ""
+                if inline:
+                    dax_lines.append(inline)
+                in_dax = True
+                continue
+
+            if stripped and any(stripped.startswith(p) for p in SIBLING_PROPS):
+                in_dax = False
+                if stripped.startswith("formatString:"):
+                    format_string = stripped.split(":", 1)[1].strip().strip("'\"")
+                elif stripped.startswith("description:"):
+                    description = stripped.split(":", 1)[1].strip().strip("'\"")
+                continue
+
+            if in_dax:
+                # Strip triple-backtick fences TMDL sometimes wraps expressions in
+                clean = stripped.strip("`").strip()
+                dax_lines.append(clean if clean else "")
+
+        while dax_lines and not dax_lines[0]:
+            dax_lines.pop(0)
+        while dax_lines and not dax_lines[-1]:
+            dax_lines.pop()
 
         return {
             "name": name,
@@ -230,11 +255,6 @@ class TMLDParser:
         return col
 
     def _parse_partition_block(self, name: str, block: list[str]) -> dict:
-        """
-        Extract mode and M expression from a partition block.
-        M expressions are multi-line, delimited by deeper indentation after 'source ='.
-        They may be wrapped in triple-backticks or just indented.
-        """
         partition: dict = {"name": name, "mode": "import", "source": {}}
         m_lines: list[str] = []
         in_source = False
@@ -245,19 +265,16 @@ class TMLDParser:
                 partition["mode"] = stripped.split(":", 1)[1].strip()
             elif stripped == "source =" or stripped.startswith("source ="):
                 in_source = True
-                # Inline expression on same line after '='
                 rest = stripped[len("source ="):].strip().strip("`")
                 if rest:
                     m_lines.append(rest)
             elif in_source:
-                # Stop collecting when we hit a non-indented sibling keyword
-                if stripped and not stripped.startswith("#") and ":" in stripped and not stripped.startswith("let") and not stripped.startswith("in ") and not stripped.startswith("//"):
-                    # Heuristic: looks like a new TMDL property, not M code
-                    sibling_keywords = {"mode:", "annotation", "description:", "sourceColumn:", "isHidden:"}
-                    if any(stripped.startswith(k) for k in sibling_keywords):
-                        in_source = False
-                        continue
-                clean = line.rstrip().strip("`")
+                sibling_keywords = {"mode:", "annotation", "description:", "sourceColumn:", "isHidden:"}
+                if any(stripped.startswith(k) for k in sibling_keywords):
+                    in_source = False
+                    continue
+                # Use stripped line (not raw) — avoids excess indentation artifacts
+                clean = stripped.strip("`")
                 if clean:
                     m_lines.append(clean)
 
@@ -267,13 +284,6 @@ class TMLDParser:
         return partition
 
     def _parse_expressions_tmdl(self, path: Path) -> list[dict]:
-        """
-        Parse expressions.tmdl which contains shared Power Query functions and
-        parameters (e.g. Transform File, Sample File, helper queries).
-        Format:
-            expression 'Name' =
-                    let ... in ...
-        """
         lines = self._lines(path)
         expressions: list[dict] = []
         current_name = ""
@@ -285,20 +295,17 @@ class TMLDParser:
             stripped = line.strip()
 
             if stripped.startswith("expression "):
-                # Flush previous
                 if current_name and m_lines:
                     expressions.append({
                         "name": current_name,
                         "kind": current_kind,
                         "expression": "\n".join(m_lines).strip(),
                     })
-                # Parse: expression 'Name' = or expression Name =
                 name_part = stripped[len("expression "):].split("=")[0].strip().strip("'\"")
                 current_name = name_part
                 current_kind = "expression"
                 m_lines = []
                 in_expr = True
-                # Inline expression
                 if "=" in stripped:
                     rest = stripped.split("=", 1)[1].strip().strip("`")
                     if rest:
@@ -310,7 +317,6 @@ class TMLDParser:
             elif stripped.startswith("lineageTag:") or stripped.startswith("annotation"):
                 in_expr = False
 
-        # Flush last
         if current_name and m_lines:
             expressions.append({
                 "name": current_name,
@@ -329,21 +335,17 @@ class TMLDParser:
         current: dict = {}
 
         def split_table_column(value: str):
-            """Split TMDL 'Table.Column' notation into (table, column).
-            Handles: dim_table.Column, 'My Table'.'My Column', dim_table.'My Column'
-            """
             value = value.strip()
-            # Match quoted or unquoted table name, followed by dot, then quoted or unquoted column
-            m = re.match(r"^'([^']+)'\.'([^']+)'$", value)  # 'Table'.'Column'
+            m = re.match(r"^'([^']+)'\.'([^']+)'$", value)
             if m:
                 return m.group(1), m.group(2)
-            m = re.match(r"^'([^']+)'\.([^\s]+)$", value)   # 'Table'.Column
+            m = re.match(r"^'([^']+)'\.([^\s]+)$", value)
             if m:
                 return m.group(1), m.group(2)
-            m = re.match(r"^([^'.]+)\.'([^']+)'$", value)   # Table.'Column'
+            m = re.match(r"^([^'.]+)\.'([^']+)'$", value)
             if m:
                 return m.group(1), m.group(2)
-            if "." in value:                                  # Table.Column (no quotes)
+            if "." in value:
                 parts = value.split(".", 1)
                 return parts[0], parts[1]
             return value, ""
@@ -413,33 +415,243 @@ class TMLDParser:
 
 
 # ---------------------------------------------------------------------------
-# Report parser (report.json)
+# Report parser (report.json) — full visual field extraction
 # ---------------------------------------------------------------------------
 
+def _extract_field_name(field: dict) -> Optional[str]:
+    """
+    Extract a human-readable field name from a PBIP field reference object.
+    Handles: Measure, Column, Aggregation, HierarchyLevel, SourceRef.
+    """
+    if not isinstance(field, dict):
+        return None
+
+    if "Measure" in field:
+        m = field["Measure"]
+        entity = m.get("Expression", {}).get("SourceRef", {}).get("Entity", "")
+        prop = m.get("Property", "")
+        return f"{entity}[{prop}]" if entity else f"[{prop}]"
+
+    if "Column" in field:
+        c = field["Column"]
+        entity = c.get("Expression", {}).get("SourceRef", {}).get("Entity", "")
+        prop = c.get("Property", "")
+        return f"{entity}[{prop}]" if entity else f"[{prop}]"
+
+    if "Aggregation" in field:
+        agg = field["Aggregation"]
+        func_map = {0: "SUM", 1: "AVG", 2: "COUNT", 3: "MIN", 4: "MAX",
+                    5: "COUNTROWS", 6: "COUNTDISTINCT"}
+        func = func_map.get(agg.get("Function", -1), "AGG")
+        expr = agg.get("Expression", {})
+        inner = _extract_field_name(expr)
+        return f"{func}({inner})" if inner else func
+
+    if "HierarchyLevel" in field:
+        hl = field["HierarchyLevel"]
+        expr = hl.get("Expression", {})
+        hier_expr = expr.get("Hierarchy", {})
+        entity = hier_expr.get("Expression", {}).get("SourceRef", {}).get("Entity", "")
+        hier_name = hier_expr.get("Hierarchy", "")
+        level = hl.get("Level", "")
+        parts = [p for p in [entity, hier_name, level] if p]
+        return ".".join(parts)
+
+    # Naked SourceRef (table reference)
+    if "SourceRef" in field:
+        return field["SourceRef"].get("Entity", "")
+
+    return None
+
+
+def _parse_visual_config(config: dict) -> dict:
+    """
+    Extract visual type, title, and field bindings from a visual container.
+
+    Supports both formats:
+    - Legacy (report.json):  config["singleVisual"]["prototypeQuery"]["Select"]
+    - Modern (visual.json):  config["visual"]["query"]["queryState"][role]["projections"]
+    """
+    # Modern format: visual is under "visual" key
+    sv = config.get("visual", config.get("singleVisual", {}))
+    visual_type = sv.get("visualType", "unknown")
+
+    # Title: look in objects.title or vcObjects.title
+    title = ""
+    for obj_key in ("objects", "vcObjects"):
+        title_obj = sv.get(obj_key, {}).get("title", [])
+        if isinstance(title_obj, list) and title_obj:
+            props = title_obj[0].get("properties", {})
+            title_text = props.get("text", {})
+            if isinstance(title_text, dict):
+                val = title_text.get("expr", {}).get("Literal", {}).get("Value", "")
+                title = val.strip("'\"")
+            elif isinstance(title_text, str):
+                title = title_text
+            if title:
+                break
+
+    fields: list[dict] = []
+
+    # --- Modern format: query.queryState ---
+    query_state = sv.get("query", {}).get("queryState", {})
+    if query_state:
+        for role_name, role_data in query_state.items():
+            for proj in role_data.get("projections", []):
+                field_ref = proj.get("field", {})
+                native_ref = proj.get("nativeQueryRef", proj.get("queryRef", ""))
+                field_name = _extract_field_name(field_ref) or native_ref
+                if field_name:
+                    fields.append({
+                        "field": field_name,
+                        "role": role_name,
+                        "displayName": native_ref,
+                    })
+
+    # --- Legacy format: prototypeQuery.Select + dataTransforms ---
+    if not fields:
+        proto_select = sv.get("prototypeQuery", {}).get("Select", [])
+        dt_selects = sv.get("dataTransforms", {}).get("selects", [])
+        dt_lookup: dict[str, dict] = {}
+        for dt in dt_selects:
+            qname = dt.get("queryName", "")
+            roles_dict = dt.get("roles", {})
+            role_name = next(iter(roles_dict.keys()), "") if roles_dict else ""
+            dt_lookup[qname] = {"role": role_name, "displayName": dt.get("displayName", "")}
+
+        for i, item in enumerate(proto_select):
+            field_name = _extract_field_name(item)
+            if not field_name:
+                continue
+            q_name = item.get("Name", "")
+            meta = dt_lookup.get(q_name, dt_selects[i] if i < len(dt_selects) else {})
+            roles_dict = meta.get("roles", {}) if isinstance(meta, dict) else {}
+            fields.append({
+                "field": field_name,
+                "role": next(iter(roles_dict.keys()), meta.get("role", "")),
+                "displayName": meta.get("displayName", ""),
+            })
+
+    return {
+        "visualType": visual_type,
+        "title": title,
+        "fields": fields,
+    }
+
+
 def parse_report(report_json_path: Path) -> dict:
-    """Extract pages and visual types from report.json"""
+    """
+    Parse legacy report.json (sections[].visualContainers[]) format.
+    Used when report.json contains a 'sections' array.
+    """
     data = read_json(report_json_path)
     result = {"pages": []}
 
-    sections = data.get("sections", [])
-    for section in sections:
+    for section in data.get("sections", []):
         page = {
             "name": section.get("displayName", section.get("name", "Unknown")),
             "visuals": [],
         }
-        for visual_container in section.get("visualContainers", []):
-            config_str = visual_container.get("config", "{}")
+
+        for vc in section.get("visualContainers", []):
+            config_str = vc.get("config", "{}")
             try:
                 config = json.loads(config_str) if isinstance(config_str, str) else config_str
             except json.JSONDecodeError:
                 config = {}
 
-            visual_type = (
-                config.get("singleVisual", {}).get("visualType")
-                or config.get("vcObjects", {})
-            )
-            if isinstance(visual_type, str):
-                page["visuals"].append(visual_type)
+            if "singleVisual" not in config:
+                continue
+
+            visual_info = _parse_visual_config(config)
+
+            if visual_info["visualType"] in ("", "unknown", "shape", "image", "textbox"):
+                if not visual_info["fields"]:
+                    continue
+
+            page["visuals"].append(visual_info)
+
+        result["pages"].append(page)
+
+    return result
+
+
+def parse_report_definition(definition_dir: Path) -> dict:
+    """
+    Parse modern PBIP report format (2023+).
+
+    Layout:
+      definition/
+        pages/
+          pages.json            ← page order: {"pageOrder": ["hash1", "hash2", ...]}
+          <hash>/
+            page.json           ← {"displayName": "...", "name": "<hash>", ...}
+            visuals/
+              <hash>/
+                visual.json     ← {"visual": {"visualType": ..., "query": ...}}
+    """
+    result = {"pages": []}
+    pages_dir = definition_dir / "pages"
+
+    if not pages_dir.exists():
+        return result
+
+    # Read page order from pages.json
+    page_order: list[str] = []
+    pages_meta_file = pages_dir / "pages.json"
+    if pages_meta_file.exists():
+        try:
+            pages_meta = read_json(pages_meta_file)
+            page_order = pages_meta.get("pageOrder", [])
+        except Exception:
+            pass
+
+    # Collect all page dirs; sort by pageOrder if available
+    all_page_dirs = {d.name: d for d in pages_dir.iterdir() if d.is_dir()}
+
+    # Build ordered list: known order first, then any remaining dirs
+    ordered_hashes = page_order + [h for h in sorted(all_page_dirs) if h not in page_order]
+
+    for page_hash in ordered_hashes:
+        page_dir = all_page_dirs.get(page_hash)
+        if not page_dir:
+            continue
+
+        page_json = page_dir / "page.json"
+        display_name = page_hash  # fallback
+        if page_json.exists():
+            try:
+                page_meta = read_json(page_json)
+                display_name = page_meta.get("displayName", page_hash)
+            except Exception:
+                pass
+
+        page = {"name": display_name, "visuals": []}
+        visuals_dir = page_dir / "visuals"
+
+        if visuals_dir.exists():
+            for visual_dir in sorted(visuals_dir.iterdir()):
+                if not visual_dir.is_dir():
+                    continue
+                visual_json = visual_dir / "visual.json"
+                if not visual_json.exists():
+                    continue
+
+                try:
+                    visual_data = read_json(visual_json)
+                except Exception:
+                    continue
+
+                # Modern format: {"visual": {"visualType": ..., "query": ...}}
+                # _parse_visual_config handles both "visual" and "singleVisual" keys
+                visual_info = _parse_visual_config(visual_data)
+
+                vtype = visual_info["visualType"]
+                if vtype in ("", "unknown", "shape", "image", "textbox"):
+                    if not visual_info["fields"]:
+                        continue
+
+                page["visuals"].append(visual_info)
 
         result["pages"].append(page)
 
@@ -467,7 +679,6 @@ def render_markdown(
     p(f"_Semantic model format: **{model_format}**_")
     p()
 
-    # Table of contents
     h2("Table of Contents")
     p("1. [Data Model Overview](#data-model-overview)")
     p("2. [Tables & Columns](#tables--columns)")
@@ -479,7 +690,6 @@ def render_markdown(
         p("6. [Report Structure](#report-structure)")
     p()
 
-    # Data model overview
     h2("Data Model Overview")
     tables = parser.tables()
     total_measures = sum(len(parser.get_measures(t)) for t in tables)
@@ -495,7 +705,6 @@ def render_markdown(
     p(f"| RLS Roles | {len(parser.roles())} |")
     p()
 
-    # Tables & Columns
     h2("Tables & Columns")
     for table in tables:
         table_name = table.get("name", "Unknown")
@@ -524,7 +733,7 @@ def render_markdown(
                 name = col.get("name", "")
                 dtype = col.get("dataType", col.get("type", "unknown"))
                 hidden = "✓" if col.get("isHidden") else ""
-                desc = col.get("description", col.get("annotations", [{}])[0].get("value", "") if isinstance(col.get("annotations"), list) and col.get("annotations") else "")
+                desc = col.get("description", "")
                 p(f"| {name} | {dtype} | {hidden} | {desc} |")
             p()
         else:
@@ -535,7 +744,6 @@ def render_markdown(
             p(f"**{len(measures)} measure(s)** — see Measure Catalogue below.")
             p()
 
-    # Measure catalogue
     h2("Measure Catalogue")
     has_measures = False
     for table in tables:
@@ -571,7 +779,6 @@ def render_markdown(
         p("_No measures found in this model._")
         p()
 
-    # Relationships
     h2("Relationships")
     rels = parser.relationships()
     if rels:
@@ -590,7 +797,6 @@ def render_markdown(
         p("_No relationships defined._")
         p()
 
-    # RLS
     roles = parser.roles()
     if roles:
         h2("Row-Level Security")
@@ -615,7 +821,7 @@ def render_markdown(
                     p(f"| {t} | `{expr}` |")
                 p()
 
-    # Report structure
+    # Report structure — now with full visual field detail
     if report_data:
         h2("Report Structure")
         pages = report_data.get("pages", [])
@@ -624,21 +830,38 @@ def render_markdown(
         for page in pages:
             h3(page["name"])
             visuals = page.get("visuals", [])
-            if visuals:
-                from collections import Counter
-                counts = Counter(visuals)
-                p("| Visual Type | Count |")
-                p("|-------------|-------|")
-                for vtype, cnt in sorted(counts.items()):
-                    p(f"| {vtype} | {cnt} |")
+            if not visuals:
+                p("_No visual information extracted._")
                 p()
-            else:
-                p("_No visual type information extracted._")
+                continue
+
+            type_counts = Counter(v["visualType"] for v in visuals)
+            p(f"**{len(visuals)} visual(s):** " + ", ".join(f"{cnt}× {vt}" for vt, cnt in sorted(type_counts.items())))
+            p()
+
+            for i, visual in enumerate(visuals, 1):
+                vtype = visual["visualType"]
+                title = visual.get("title", "")
+                fields = visual.get("fields", [])
+
+                header = f"**Visual {i}: `{vtype}`**"
+                if title:
+                    header += f" — _{title}_"
+                p(header)
+
+                if fields:
+                    p("| Role | Field | Display Name |")
+                    p("|------|-------|--------------|")
+                    for f in fields:
+                        role = f.get("role", "")
+                        field = f.get("field", "")
+                        display = f.get("displayName", "")
+                        p(f"| {role} | `{field}` | {display} |")
+                else:
+                    p("_No field bindings extracted._")
                 p()
 
-    # Power Query
     h2("Power Query (M) Sources")
-
     has_pq = False
     for table in tables:
         partitions = parser.get_partitions(table)
@@ -661,7 +884,6 @@ def render_markdown(
         p("_No Power Query expressions found (model may use DirectQuery or live connection)._")
         p()
 
-    # Shared expressions (expressions.tmdl)
     shared = parser.shared_expressions()
     if shared:
         h2("Shared Power Query Functions & Parameters")
@@ -693,27 +915,22 @@ def render_markdown(
 # ---------------------------------------------------------------------------
 
 def extract_dax_refs(dax: str, all_tables: list[str], all_measures: list[str]) -> dict:
-    """
-    Pull referenced tables, columns, and measures out of a DAX expression.
-    This is heuristic, not a full DAX parser — covers 95% of real-world patterns.
-    Returns: {"tables": [...], "columns": [...], "measures": [...]}
-    """
     refs: dict = {"tables": set(), "columns": set(), "measures": set()}
 
-    # Table[Column] pattern
     for match in re.finditer(r"'?([A-Za-z0-9_ ]+)'?\[([^\]]+)\]", dax):
         t, c = match.group(1).strip(), match.group(2).strip()
-        refs["tables"].add(t)
-        refs["columns"].add(f"{t}[{c}]")
+        if t:  # skip blank table prefix from bare [Column] matches
+            refs["tables"].add(t)
+            refs["columns"].add(f"{t}[{c}]")
 
-    # Standalone [Measure or Column] — match against known measure names
     for match in re.finditer(r"(?<!')\[([^\]]+)\]", dax):
         name = match.group(1).strip()
         if name in all_measures:
             refs["measures"].add(name)
 
-    # CALCULATE, FILTER etc. with bare table names
     for t in all_tables:
+        if not t:
+            continue
         pattern = rf"\b{re.escape(t)}\b"
         if re.search(pattern, dax, re.IGNORECASE):
             refs["tables"].add(t)
@@ -722,10 +939,6 @@ def extract_dax_refs(dax: str, all_tables: list[str], all_measures: list[str]) -
 
 
 def describe_dax(dax: str) -> str:
-    """
-    Produce a one-line plain-English description of what a DAX expression does,
-    based on the top-level function used. Not exhaustive but useful for LLM context.
-    """
     dax_upper = dax.strip().upper()
     patterns = [
         (r"^CALCULATE\s*\(", "A CALCULATE expression that evaluates a value in a modified filter context."),
@@ -780,23 +993,6 @@ def render_copilot_kb(
     report_data: Optional[dict],
     model_format: str,
 ) -> str:
-    """
-    Generates a plain-text knowledge base optimised for LLM context injection.
-
-    Design principles:
-    - Every entity is described in full prose sentences, not tables.
-    - Every measure gets: what it does, its full DAX, which columns/tables/measures it
-      depends on, and its format string.
-    - Every column gets: its table, data type, and any description.
-    - Relationships are described directionally in plain language.
-    - The file opens with an index so the LLM knows what's in it.
-
-    This format works best when:
-    - Uploaded as a file to Copilot for Microsoft 365 / ChatGPT
-    - Pasted as context into a Claude Project
-    - Used as a system prompt prefix for a custom Copilot Studio bot
-    """
-
     tables = parser.tables()
     all_table_names = [t.get("name", "") for t in tables]
     all_measure_names = [
@@ -808,9 +1004,6 @@ def render_copilot_kb(
     lines: list[str] = []
     def w(s=""): lines.append(s)
 
-    # -------------------------------------------------------------------------
-    # Header & instructions for the LLM
-    # -------------------------------------------------------------------------
     w("=" * 80)
     w(f"POWER BI KNOWLEDGE BASE: {project_name.upper()}")
     w(f"Semantic model format: {model_format}")
@@ -824,18 +1017,16 @@ def render_copilot_kb(
     w("- What columns exist in which tables and what they represent")
     w("- How tables are related to each other")
     w("- Which measures depend on other measures or columns")
-    w("- Which pages and visuals exist in the report")
+    w("- Which pages and visuals exist in the report, and which fields each visual uses")
     w()
     w("When answering questions about a measure, always explain:")
     w("1. What the measure calculates in plain language")
     w("2. The exact DAX formula")
     w("3. Which tables and columns it touches")
     w("4. Which other measures it calls (if any)")
+    w("5. Which report visuals use this measure (if applicable)")
     w()
 
-    # -------------------------------------------------------------------------
-    # Index
-    # -------------------------------------------------------------------------
     w("=" * 80)
     w("INDEX")
     w("=" * 80)
@@ -845,12 +1036,11 @@ def render_copilot_kb(
     w(f"Relationships: {len(parser.relationships())}")
     w(f"RLS Roles: {len(parser.roles())}")
     if report_data:
-        w(f"Report pages: {len(report_data.get('pages', []))}")
+        pages = report_data.get("pages", [])
+        total_visuals = sum(len(p.get("visuals", [])) for p in pages)
+        w(f"Report pages: {len(pages)} ({total_visuals} visuals total)")
     w()
 
-    # -------------------------------------------------------------------------
-    # Tables & columns
-    # -------------------------------------------------------------------------
     w("=" * 80)
     w("SECTION 1: TABLES AND COLUMNS")
     w("=" * 80)
@@ -865,7 +1055,6 @@ def render_copilot_kb(
         w(f"TABLE: {table_name}")
         w("-" * 60)
 
-        # Source query if available
         for pt in partitions:
             source = pt.get("source", {})
             if isinstance(source, dict):
@@ -900,9 +1089,6 @@ def render_copilot_kb(
 
         w()
 
-    # -------------------------------------------------------------------------
-    # Measures — the most important section for Q&A
-    # -------------------------------------------------------------------------
     w("=" * 80)
     w("SECTION 2: MEASURES (FULL DAX AND DEPENDENCIES)")
     w("=" * 80)
@@ -910,6 +1096,25 @@ def render_copilot_kb(
     w("Each measure below includes its full DAX formula, a plain-language explanation,")
     w("and a list of all columns, tables, and other measures it depends on.")
     w()
+
+    # Build a lookup: measure name → list of visuals that use it
+    measure_visual_usage: dict[str, list[str]] = {}
+    if report_data:
+        for page in report_data.get("pages", []):
+            page_name = page["name"]
+            for visual in page.get("visuals", []):
+                vtype = visual["visualType"]
+                title = visual.get("title", "")
+                label = f'"{title}" ({vtype}) on page "{page_name}"' if title else f'{vtype} on page "{page_name}"'
+                for f in visual.get("fields", []):
+                    field_str = f.get("field", "")
+                    # field_str is like "Table[Measure]" or "[Measure]"
+                    # extract the measure name from brackets
+                    m = re.search(r"\[([^\]]+)\]", field_str)
+                    if m:
+                        fname = m.group(1)
+                        if fname in all_measure_names:
+                            measure_visual_usage.setdefault(fname, []).append(label)
 
     for table in tables:
         measures = parser.get_measures(table)
@@ -929,29 +1134,25 @@ def render_copilot_kb(
 
             if desc:
                 w(f"Description: {desc}")
-
             if fmt:
                 w(f"Display format: {fmt}")
 
-            # Plain-language description of the DAX pattern
             if dax:
                 plain = describe_dax(dax)
                 w(f"What it does: {plain}")
             w()
 
-            # Full DAX
             if dax:
                 w("Full DAX formula:")
                 w(dax)
                 w()
 
-                # Dependencies
                 deps = extract_dax_refs(dax, all_table_names, all_measure_names)
 
                 if deps["measures"]:
                     w("This measure calls the following other measures:")
                     for m in deps["measures"]:
-                        if m != name:  # avoid self-reference
+                        if m != name:
                             w(f'  - "{m}"')
                     w()
 
@@ -970,11 +1171,16 @@ def render_copilot_kb(
                 w("No DAX expression was found for this measure.")
                 w()
 
+            # Visual usage
+            usages = measure_visual_usage.get(name, [])
+            if usages:
+                w(f"This measure is used in {len(usages)} visual(s):")
+                for usage in usages:
+                    w(f"  - {usage}")
+                w()
+
             w()
 
-    # -------------------------------------------------------------------------
-    # Relationships
-    # -------------------------------------------------------------------------
     w("=" * 80)
     w("SECTION 3: RELATIONSHIPS")
     w("=" * 80)
@@ -1001,9 +1207,6 @@ def render_copilot_kb(
         w("No relationships are defined in this model.")
         w()
 
-    # -------------------------------------------------------------------------
-    # RLS
-    # -------------------------------------------------------------------------
     roles = parser.roles()
     if roles:
         w("=" * 80)
@@ -1024,37 +1227,56 @@ def render_copilot_kb(
                         w(f'  Table "{t}" is included in this role (no filter expression).')
             w()
 
-    # -------------------------------------------------------------------------
-    # Report structure
-    # -------------------------------------------------------------------------
     if report_data:
         w("=" * 80)
-        w("SECTION 5: REPORT STRUCTURE")
+        w("SECTION 5: REPORT STRUCTURE AND VISUAL FIELD BINDINGS")
         w("=" * 80)
         w()
         pages = report_data.get("pages", [])
-        w(f"The report has {len(pages)} page(s):")
+        w(f"The report has {len(pages)} page(s).")
         w()
+        w("For each visual, the fields listed show which measures and columns")
+        w("are bound to it, along with the role (axis, values, legend, etc.).")
+        w()
+
         for page in pages:
             page_name = page["name"]
             visuals = page.get("visuals", [])
-            w(f"Page: {page_name}")
-            if visuals:
-                from collections import Counter
-                counts = Counter(visuals)
-                visual_desc = ", ".join(f"{cnt}x {vtype}" for vtype, cnt in sorted(counts.items()))
-                w(f"  Visuals: {visual_desc}")
-            else:
-                w("  No visual type information available.")
-            w()
+            w(f"Page: {page_name} ({len(visuals)} visual(s))")
+            w("-" * 60)
+
+            if not visuals:
+                w("  No visual information available.")
+                w()
+                continue
+
+            for i, visual in enumerate(visuals, 1):
+                vtype = visual["visualType"]
+                title = visual.get("title", "")
+                fields = visual.get("fields", [])
+
+                label = f'Visual {i}: {vtype}'
+                if title:
+                    label += f' (title: "{title}")'
+                w(f"  {label}")
+
+                if fields:
+                    for f in fields:
+                        role = f.get("role", "")
+                        field = f.get("field", "")
+                        display = f.get("displayName", "")
+                        role_str = f" [{role}]" if role else ""
+                        display_str = f' (shown as "{display}")' if display and display != field else ""
+                        w(f"    - {field}{role_str}{display_str}")
+                else:
+                    w("    No field bindings extracted.")
+                w()
 
     w("=" * 80)
     w("SECTION 6: POWER QUERY (M) SOURCES")
     w("=" * 80)
     w()
     w("Each table below shows the full Power Query (M) expression used to load its data.")
-    w("Use this to answer questions about where data comes from, what transformations")
-    w("are applied, and how columns are derived before they reach the data model.")
     w()
 
     has_pq = False
@@ -1083,10 +1305,6 @@ def render_copilot_kb(
         w("SECTION 7: SHARED POWER QUERY FUNCTIONS AND PARAMETERS")
         w("=" * 80)
         w()
-        w("These are helper functions and parameters defined in expressions.tmdl.")
-        w("They are called from table queries above. Use this to understand reusable")
-        w("transformation logic shared across multiple tables.")
-        w()
         for expr in shared:
             name = expr.get("name", "")
             kind = expr.get("kind", "")
@@ -1109,23 +1327,13 @@ def render_copilot_kb(
 # ---------------------------------------------------------------------------
 
 def find_semantic_model(pbip_root: Path) -> tuple[Optional[Path], str]:
-    """
-    Returns (path, format) where format is 'TMSL' or 'TMDL'.
-
-    Handles both naming conventions:
-      - Classic:  SemanticModel/definition/
-      - Modern:   <name>.SemanticModel/definition/   (Fabric/PBIP default)
-    """
-    # TMDL: definition/ folder containing database.tmdl
     for candidate in pbip_root.rglob("database.tmdl"):
         return candidate.parent, "TMDL"
 
-    # TMDL: definition/ folder without database.tmdl (tables-only layout)
     for candidate in pbip_root.rglob("definition"):
         if candidate.is_dir() and any(candidate.glob("*.tmdl")):
             return candidate, "TMDL"
 
-    # TMSL: any .bim file
     for candidate in pbip_root.rglob("*.bim"):
         return candidate, "TMSL"
 
@@ -1133,9 +1341,29 @@ def find_semantic_model(pbip_root: Path) -> tuple[Optional[Path], str]:
 
 
 def find_report_json(pbip_root: Path) -> Optional[Path]:
-    # Handles both report/report.json and <name>.Report/report.json
+    """
+    Returns the report.json path only if it's the legacy format that contains
+    'sections' with 'visualContainers'. Modern PBIP stores pages as separate files.
+    """
     for candidate in pbip_root.rglob("report.json"):
-        return candidate
+        try:
+            data = read_json(candidate)
+            if data.get("sections"):
+                return candidate
+        except Exception:
+            pass
+    return None
+
+
+def find_report_definition_dir(pbip_root: Path) -> Optional[Path]:
+    """
+    Finds the report definition/ folder used by modern PBIP format.
+    Identified by: <report>.Report/definition/pages/pages.json
+    """
+    for candidate in pbip_root.rglob("pages.json"):
+        pages_dir = candidate.parent
+        if pages_dir.name == "pages":
+            return pages_dir.parent  # definition/
     return None
 
 
@@ -1152,10 +1380,7 @@ def main():
         action="store_true",
         help=(
             "Generate a plain-text knowledge base optimised for Copilot / ChatGPT "
-            "context injection instead of Markdown docs. Upload the output .txt file "
-            "to Copilot for Microsoft 365, paste it into a Claude Project, or use it "
-            "as a system prompt. Includes prose descriptions, full DAX, and dependency "
-            "analysis for every measure."
+            "context injection instead of Markdown docs."
         ),
     )
     args = ap.parse_args()
@@ -1167,7 +1392,6 @@ def main():
 
     project_name = pbip_root.name.replace(".pbip", "").replace("_", " ").title()
 
-    # Find semantic model
     model_path, model_format = find_semantic_model(pbip_root)
     if not model_path:
         print("ERROR: No semantic model found (.bim or TMDL definition folder).", file=sys.stderr)
@@ -1180,17 +1404,37 @@ def main():
     else:
         parser = TMLDParser(model_path)
 
-    # Find report.json
-    report_json_path = find_report_json(pbip_root)
     report_data = None
-    if report_json_path:
-        print(f"Found report: {report_json_path}")
+
+    # Try modern PBIP format first (definition/pages/*/page.json + visuals/*/visual.json)
+    report_def_dir = find_report_definition_dir(pbip_root)
+    if report_def_dir:
+        print(f"Found modern report definition: {report_def_dir}")
         try:
-            report_data = parse_report(report_json_path)
+            report_data = parse_report_definition(report_def_dir)
         except Exception as e:
-            print(f"WARNING: Could not parse report.json: {e}", file=sys.stderr)
-    else:
-        print("No report.json found — skipping report structure section.")
+            print(f"WARNING: Could not parse modern report definition: {e}", file=sys.stderr)
+
+    # Fall back to legacy report.json (sections[].visualContainers[])
+    if not report_data or not report_data.get("pages"):
+        report_json_path = find_report_json(pbip_root)
+        if report_json_path:
+            print(f"Found legacy report.json: {report_json_path}")
+            try:
+                report_data = parse_report(report_json_path)
+            except Exception as e:
+                print(f"WARNING: Could not parse report.json: {e}", file=sys.stderr)
+        else:
+            print("No report found — skipping report structure section.")
+
+    if report_data and report_data.get("pages"):
+        total_visuals = sum(len(p.get("visuals", [])) for p in report_data["pages"])
+        total_fields = sum(
+            len(v.get("fields", []))
+            for p in report_data["pages"]
+            for v in p.get("visuals", [])
+        )
+        print(f"  Pages: {len(report_data['pages'])}, Visuals: {total_visuals}, Field bindings: {total_fields}")
 
     tables = parser.tables()
     n_measures = sum(len(parser.get_measures(t)) for t in tables)
