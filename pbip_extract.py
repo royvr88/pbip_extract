@@ -22,6 +22,7 @@ import json
 import os
 import re
 import sys
+import urllib.parse
 from collections import Counter
 from pathlib import Path
 from typing import Optional
@@ -38,6 +39,52 @@ def read_json(path: Path) -> dict:
 
 def slugify(name: str) -> str:
     return re.sub(r"[^\w\-]", "-", name).lower()
+
+
+# ---------------------------------------------------------------------------
+# Sanitizer — maskeert organisatie-specifieke connectiestrings vóór output
+# ---------------------------------------------------------------------------
+
+_SHAREPOINT_URL_RE = re.compile(
+    r'https?://[a-zA-Z0-9\-]+\.sharepoint\.com/sites/[^"\')\s,\]]+',
+    re.IGNORECASE,
+)
+
+# Bestandsnamen die intern zijn maar niet gevoelig (bijv. swt_producten.xlsx) laten we staan.
+# Alleen de volledige URL wordt gemaskeerd.
+
+def sanitize(text: str) -> str:
+    """
+    Maskeert SharePoint-URLs in Power Query / DAX expressions vóór output.
+
+    Wat er gebeurt:
+      https://organisatie.sharepoint.com/sites/SITENAAM/Gedeelde%20documenten/map/bestand.xlsx
+      → https://[TENANT].sharepoint.com/sites/[SITE]/Gedeelde documenten/map/bestand.xlsx
+
+    De tenant-naam en sitenaam worden vervangen; het pad daarna blijft leesbaar
+    zodat duidelijk is welke map/bestand de bron is.
+    """
+    if not text:
+        return text
+
+    def _replace(m: re.Match) -> str:
+        url = m.group(0)
+        try:
+            parsed = urllib.parse.urlparse(url)
+            # Decodeer %20 etc. zodat het pad leesbaar is
+            path_decoded = urllib.parse.unquote(parsed.path)
+            parts = path_decoded.strip("/").split("/")
+            # parts[0] = "sites", parts[1] = sitenaam, parts[2:] = rest van het pad
+            if len(parts) >= 2 and parts[0].lower() == "sites":
+                rest = "/" + "/".join(parts[2:]) if len(parts) > 2 else ""
+                masked = f"https://[TENANT].sharepoint.com/sites/[SITE]{rest}"
+            else:
+                masked = "https://[TENANT].sharepoint.com/[PAD]"
+        except Exception:
+            masked = "[SHAREPOINT-URL]"
+        return masked
+
+    return _SHAREPOINT_URL_RE.sub(_replace, text)
 
 
 # ---------------------------------------------------------------------------
@@ -78,14 +125,6 @@ class TMSLParser:
 # ---------------------------------------------------------------------------
 
 class TMLDParser:
-    """
-    Parses TMDL files. TMDL is an indentation-based DSL, not JSON.
-    Each table lives in its own .tmdl file under SemanticModel/definition/tables/
-    The database.tmdl contains top-level model metadata.
-    relationships.tmdl contains relationships.
-    roles/ contains RLS roles.
-    """
-
     def __init__(self, definition_dir: Path):
         self.definition_dir = definition_dir
         self._tables: list[dict] = []
@@ -162,10 +201,9 @@ class TMLDParser:
             if stripped.startswith("measure ") and line.startswith("\t") and not line.startswith("\t\t"):
                 flush_block()
                 current_type = "measure"
-                # Strip optional quotes from name: 'My Measure' = ... → My Measure
                 raw_name = stripped[8:].split("=")[0].strip().strip("'")
                 current_name = raw_name
-                current_block = [line]  # pass raw line so indentation is preserved
+                current_block = [line]
             elif stripped.startswith("column ") and line.startswith("\t") and not line.startswith("\t\t"):
                 flush_block()
                 current_type = "column"
@@ -177,25 +215,13 @@ class TMLDParser:
                 current_name = stripped[10:].strip().strip("'")
                 current_block = [line]
             elif current_type:
-                current_block.append(line)  # preserve raw indentation
+                current_block.append(line)
             i += 1
 
         flush_block()
         return table
 
     def _parse_measure_block(self, name: str, block: list[str]) -> dict:
-        """
-        Parse a measure block from raw TMDL lines (indentation preserved).
-
-        TMDL layout:
-            \\tmeasure 'Name' =
-            \\t\\t\\tDAX line 1
-            \\t\\t\\tDAX line 2
-            \\t\\tformatString: 0
-            \\t\\tlineageTag: ...
-
-        DAX body follows the header until first sibling property at double-tab level.
-        """
         dax_lines: list[str] = []
         description = ""
         format_string = ""
@@ -227,7 +253,6 @@ class TMLDParser:
                 continue
 
             if in_dax:
-                # Strip triple-backtick fences TMDL sometimes wraps expressions in
                 clean = stripped.strip("`").strip()
                 dax_lines.append(clean if clean else "")
 
@@ -273,7 +298,6 @@ class TMLDParser:
                 if any(stripped.startswith(k) for k in sibling_keywords):
                     in_source = False
                     continue
-                # Use stripped line (not raw) — avoids excess indentation artifacts
                 clean = stripped.strip("`")
                 if clean:
                     m_lines.append(clean)
@@ -415,14 +439,10 @@ class TMLDParser:
 
 
 # ---------------------------------------------------------------------------
-# Report parser (report.json) — full visual field extraction
+# Report parser (report.json)
 # ---------------------------------------------------------------------------
 
 def _extract_field_name(field: dict) -> Optional[str]:
-    """
-    Extract a human-readable field name from a PBIP field reference object.
-    Handles: Measure, Column, Aggregation, HierarchyLevel, SourceRef.
-    """
     if not isinstance(field, dict):
         return None
 
@@ -457,7 +477,6 @@ def _extract_field_name(field: dict) -> Optional[str]:
         parts = [p for p in [entity, hier_name, level] if p]
         return ".".join(parts)
 
-    # Naked SourceRef (table reference)
     if "SourceRef" in field:
         return field["SourceRef"].get("Entity", "")
 
@@ -465,18 +484,9 @@ def _extract_field_name(field: dict) -> Optional[str]:
 
 
 def _parse_visual_config(config: dict) -> dict:
-    """
-    Extract visual type, title, and field bindings from a visual container.
-
-    Supports both formats:
-    - Legacy (report.json):  config["singleVisual"]["prototypeQuery"]["Select"]
-    - Modern (visual.json):  config["visual"]["query"]["queryState"][role]["projections"]
-    """
-    # Modern format: visual is under "visual" key
     sv = config.get("visual", config.get("singleVisual", {}))
     visual_type = sv.get("visualType", "unknown")
 
-    # Title: look in objects.title or vcObjects.title
     title = ""
     for obj_key in ("objects", "vcObjects"):
         title_obj = sv.get(obj_key, {}).get("title", [])
@@ -493,7 +503,6 @@ def _parse_visual_config(config: dict) -> dict:
 
     fields: list[dict] = []
 
-    # --- Modern format: query.queryState ---
     query_state = sv.get("query", {}).get("queryState", {})
     if query_state:
         for role_name, role_data in query_state.items():
@@ -508,7 +517,6 @@ def _parse_visual_config(config: dict) -> dict:
                         "displayName": native_ref,
                     })
 
-    # --- Legacy format: prototypeQuery.Select + dataTransforms ---
     if not fields:
         proto_select = sv.get("prototypeQuery", {}).get("Select", [])
         dt_selects = sv.get("dataTransforms", {}).get("selects", [])
@@ -540,10 +548,6 @@ def _parse_visual_config(config: dict) -> dict:
 
 
 def parse_report(report_json_path: Path) -> dict:
-    """
-    Parse legacy report.json (sections[].visualContainers[]) format.
-    Used when report.json contains a 'sections' array.
-    """
     data = read_json(report_json_path)
     result = {"pages": []}
 
@@ -577,26 +581,12 @@ def parse_report(report_json_path: Path) -> dict:
 
 
 def parse_report_definition(definition_dir: Path) -> dict:
-    """
-    Parse modern PBIP report format (2023+).
-
-    Layout:
-      definition/
-        pages/
-          pages.json            ← page order: {"pageOrder": ["hash1", "hash2", ...]}
-          <hash>/
-            page.json           ← {"displayName": "...", "name": "<hash>", ...}
-            visuals/
-              <hash>/
-                visual.json     ← {"visual": {"visualType": ..., "query": ...}}
-    """
     result = {"pages": []}
     pages_dir = definition_dir / "pages"
 
     if not pages_dir.exists():
         return result
 
-    # Read page order from pages.json
     page_order: list[str] = []
     pages_meta_file = pages_dir / "pages.json"
     if pages_meta_file.exists():
@@ -606,10 +596,7 @@ def parse_report_definition(definition_dir: Path) -> dict:
         except Exception:
             pass
 
-    # Collect all page dirs; sort by pageOrder if available
     all_page_dirs = {d.name: d for d in pages_dir.iterdir() if d.is_dir()}
-
-    # Build ordered list: known order first, then any remaining dirs
     ordered_hashes = page_order + [h for h in sorted(all_page_dirs) if h not in page_order]
 
     for page_hash in ordered_hashes:
@@ -618,7 +605,7 @@ def parse_report_definition(definition_dir: Path) -> dict:
             continue
 
         page_json = page_dir / "page.json"
-        display_name = page_hash  # fallback
+        display_name = page_hash
         if page_json.exists():
             try:
                 page_meta = read_json(page_json)
@@ -642,8 +629,6 @@ def parse_report_definition(definition_dir: Path) -> dict:
                 except Exception:
                     continue
 
-                # Modern format: {"visual": {"visualType": ..., "query": ...}}
-                # _parse_visual_config handles both "visual" and "singleVisual" keys
                 visual_info = _parse_visual_config(visual_data)
 
                 vtype = visual_info["visualType"]
@@ -721,7 +706,9 @@ def render_markdown(
                 if isinstance(source, dict):
                     query = source.get("query", source.get("expression", ""))
                     if query:
-                        source_info = f"`{query[:120]}{'...' if len(query) > 120 else ''}`"
+                        # ↓ sanitize vóór output
+                        query_clean = sanitize(query)
+                        source_info = f"`{query_clean[:120]}{'...' if len(query_clean) > 120 else ''}`"
             if source_info:
                 p(f"**Source:** {source_info}")
                 p()
@@ -769,7 +756,8 @@ def render_markdown(
                 p()
             if dax:
                 p("```dax")
-                p(dax)
+                # DAX bevat normaal geen URLs, maar voor de zekerheid
+                p(sanitize(dax))
                 p("```")
             else:
                 p("_No DAX expression found._")
@@ -821,7 +809,6 @@ def render_markdown(
                     p(f"| {t} | `{expr}` |")
                 p()
 
-    # Report structure — now with full visual field detail
     if report_data:
         h2("Report Structure")
         pages = report_data.get("pages", [])
@@ -876,7 +863,8 @@ def render_markdown(
             p(f"**Mode:** `{pt.get('mode', 'import')}`")
             p()
             p("```powerquery")
-            p(expr.strip())
+            # ↓ sanitize vóór output
+            p(sanitize(expr.strip()))
             p("```")
             p()
 
@@ -900,7 +888,8 @@ def render_markdown(
                 p()
             if body:
                 p("```powerquery")
-                p(body)
+                # ↓ sanitize vóór output
+                p(sanitize(body))
                 p("```")
             p()
 
@@ -919,7 +908,7 @@ def extract_dax_refs(dax: str, all_tables: list[str], all_measures: list[str]) -
 
     for match in re.finditer(r"'?([A-Za-z0-9_ ]+)'?\[([^\]]+)\]", dax):
         t, c = match.group(1).strip(), match.group(2).strip()
-        if t:  # skip blank table prefix from bare [Column] matches
+        if t:
             refs["tables"].add(t)
             refs["columns"].add(f"{t}[{c}]")
 
@@ -1061,7 +1050,8 @@ def render_copilot_kb(
                 query = source.get("query", source.get("expression", ""))
                 if query:
                     w(f"This table is loaded from the following query:")
-                    w(query.strip())
+                    # ↓ sanitize vóór output
+                    w(sanitize(query.strip()))
                     w()
 
         if columns:
@@ -1093,11 +1083,7 @@ def render_copilot_kb(
     w("SECTION 2: MEASURES (FULL DAX AND DEPENDENCIES)")
     w("=" * 80)
     w()
-    w("Each measure below includes its full DAX formula, a plain-language explanation,")
-    w("and a list of all columns, tables, and other measures it depends on.")
-    w()
 
-    # Build a lookup: measure name → list of visuals that use it
     measure_visual_usage: dict[str, list[str]] = {}
     if report_data:
         for page in report_data.get("pages", []):
@@ -1108,8 +1094,6 @@ def render_copilot_kb(
                 label = f'"{title}" ({vtype}) on page "{page_name}"' if title else f'{vtype} on page "{page_name}"'
                 for f in visual.get("fields", []):
                     field_str = f.get("field", "")
-                    # field_str is like "Table[Measure]" or "[Measure]"
-                    # extract the measure name from brackets
                     m = re.search(r"\[([^\]]+)\]", field_str)
                     if m:
                         fname = m.group(1)
@@ -1144,7 +1128,8 @@ def render_copilot_kb(
 
             if dax:
                 w("Full DAX formula:")
-                w(dax)
+                # ↓ sanitize vóór output
+                w(sanitize(dax))
                 w()
 
                 deps = extract_dax_refs(dax, all_table_names, all_measure_names)
@@ -1171,7 +1156,6 @@ def render_copilot_kb(
                 w("No DAX expression was found for this measure.")
                 w()
 
-            # Visual usage
             usages = measure_visual_usage.get(name, [])
             if usages:
                 w(f"This measure is used in {len(usages)} visual(s):")
@@ -1235,10 +1219,6 @@ def render_copilot_kb(
         pages = report_data.get("pages", [])
         w(f"The report has {len(pages)} page(s).")
         w()
-        w("For each visual, the fields listed show which measures and columns")
-        w("are bound to it, along with the role (axis, values, legend, etc.).")
-        w()
-
         for page in pages:
             page_name = page["name"]
             visuals = page.get("visuals", [])
@@ -1276,8 +1256,6 @@ def render_copilot_kb(
     w("SECTION 6: POWER QUERY (M) SOURCES")
     w("=" * 80)
     w()
-    w("Each table below shows the full Power Query (M) expression used to load its data.")
-    w()
 
     has_pq = False
     for table in tables:
@@ -1292,7 +1270,8 @@ def render_copilot_kb(
             w(f"Table: {table_name} (mode: {pt.get('mode', 'import')})")
             w("-" * 60)
             w("Power Query expression:")
-            w(expr.strip())
+            # ↓ sanitize vóór output
+            w(sanitize(expr.strip()))
             w()
 
     if not has_pq:
@@ -1312,7 +1291,8 @@ def render_copilot_kb(
             w(f"Shared expression: {name} (kind: {kind})")
             w("-" * 60)
             if body:
-                w(body)
+                # ↓ sanitize vóór output
+                w(sanitize(body))
             w()
 
     w("=" * 80)
@@ -1341,10 +1321,6 @@ def find_semantic_model(pbip_root: Path) -> tuple[Optional[Path], str]:
 
 
 def find_report_json(pbip_root: Path) -> Optional[Path]:
-    """
-    Returns the report.json path only if it's the legacy format that contains
-    'sections' with 'visualContainers'. Modern PBIP stores pages as separate files.
-    """
     for candidate in pbip_root.rglob("report.json"):
         try:
             data = read_json(candidate)
@@ -1356,14 +1332,10 @@ def find_report_json(pbip_root: Path) -> Optional[Path]:
 
 
 def find_report_definition_dir(pbip_root: Path) -> Optional[Path]:
-    """
-    Finds the report definition/ folder used by modern PBIP format.
-    Identified by: <report>.Report/definition/pages/pages.json
-    """
     for candidate in pbip_root.rglob("pages.json"):
         pages_dir = candidate.parent
         if pages_dir.name == "pages":
-            return pages_dir.parent  # definition/
+            return pages_dir.parent
     return None
 
 
@@ -1406,7 +1378,6 @@ def main():
 
     report_data = None
 
-    # Try modern PBIP format first (definition/pages/*/page.json + visuals/*/visual.json)
     report_def_dir = find_report_definition_dir(pbip_root)
     if report_def_dir:
         print(f"Found modern report definition: {report_def_dir}")
@@ -1415,7 +1386,6 @@ def main():
         except Exception as e:
             print(f"WARNING: Could not parse modern report definition: {e}", file=sys.stderr)
 
-    # Fall back to legacy report.json (sections[].visualContainers[])
     if not report_data or not report_data.get("pages"):
         report_json_path = find_report_json(pbip_root)
         if report_json_path:
