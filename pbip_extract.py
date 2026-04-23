@@ -99,7 +99,7 @@ class TMSLParser:
         return self.data.get("model", self.data)
 
     def tables(self) -> list[dict]:
-        return self._model().get("tables", [])
+        return [t for t in self._model().get("tables", []) if not t.get("isHidden", False)]
 
     def relationships(self) -> list[dict]:
         return self._model().get("relationships", [])
@@ -137,7 +137,7 @@ class TMLDParser:
         if tables_dir.exists():
             for tmdl_file in sorted(tables_dir.glob("*.tmdl")):
                 table = self._parse_table_file(tmdl_file)
-                if table:
+                if table and not table.get("isHidden", False):
                     self._tables.append(table)
 
         rel_file = self.definition_dir / "relationships.tmdl"
@@ -165,7 +165,7 @@ class TMLDParser:
         if not lines:
             return None
 
-        table: dict = {"name": "", "columns": [], "measures": [], "partitions": []}
+        table: dict = {"name": "", "isHidden": False, "columns": [], "measures": [], "partitions": []}
         i = 0
 
         while i < len(lines) and not lines[i].strip():
@@ -214,6 +214,8 @@ class TMLDParser:
                 current_type = "partition"
                 current_name = stripped[10:].strip().strip("'")
                 current_block = [line]
+            elif stripped.startswith("isHidden:") and line.startswith("\t") and not line.startswith("\t\t"):
+                table["isHidden"] = "true" in stripped.lower()
             elif current_type:
                 current_block.append(line)
             i += 1
