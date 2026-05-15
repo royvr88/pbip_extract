@@ -1359,9 +1359,13 @@ def main():
     )
     args = ap.parse_args()
 
-    pbip_root = Path(args.pbip_path).resolve()
+    input_path = Path(args.pbip_path)
+    if input_path.is_absolute():
+        pbip_root = input_path
+    else:
+        pbip_root = Path.cwd() / args.pbip_path.lstrip('/\\')
     if not pbip_root.exists():
-        print(f"ERROR: Path does not exist: {pbip_root}", file=sys.stderr)
+        print(f"ERROR: Path does not exist: {pbip_root.resolve()}", file=sys.stderr)
         sys.exit(1)
 
     project_name = pbip_root.name.replace(".pbip", "").replace("_", " ").title()
