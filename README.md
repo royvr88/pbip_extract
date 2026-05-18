@@ -18,6 +18,17 @@ Supports both **TMSL** (`.bim`) and **TMDL** (`.tmdl`) semantic model formats.
 
 ## Usage
 
+The path can be absolute or relative to the directory you run the script from:
+
+```bash
+# Absolute path
+python pbip_extract.py "C:\Users\you\Documents\MyReport"
+
+# Relative path (resolved from current directory)
+python pbip_extract.py MyReport
+python pbip_extract.py ./MyReport
+```
+
 ```bash
 # Markdown docs
 python pbip_extract.py <path-to-pbip-folder>
