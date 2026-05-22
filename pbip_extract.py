@@ -3,6 +3,7 @@
 pbip_document.py — Power BI Project (.pbip) Documentation Generator
 
 Supports both TMSL (.bim) and TMDL (.tmdl) semantic model formats.
+Also works with report-only folders (no semantic model present).
 
 Output modes:
   Default:   Markdown documentation (human-readable reference)
@@ -42,7 +43,7 @@ def slugify(name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Sanitizer — maskeert organisatie-specifieke connectiestrings vóór output
+# Sanitizer
 # ---------------------------------------------------------------------------
 
 _SHAREPOINT_URL_RE = re.compile(
@@ -50,20 +51,7 @@ _SHAREPOINT_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Bestandsnamen die intern zijn maar niet gevoelig (bijv. swt_producten.xlsx) laten we staan.
-# Alleen de volledige URL wordt gemaskeerd.
-
 def sanitize(text: str) -> str:
-    """
-    Maskeert SharePoint-URLs in Power Query / DAX expressions vóór output.
-
-    Wat er gebeurt:
-      https://organisatie.sharepoint.com/sites/SITENAAM/Gedeelde%20documenten/map/bestand.xlsx
-      → https://[TENANT].sharepoint.com/sites/[SITE]/Gedeelde documenten/map/bestand.xlsx
-
-    De tenant-naam en sitenaam worden vervangen; het pad daarna blijft leesbaar
-    zodat duidelijk is welke map/bestand de bron is.
-    """
     if not text:
         return text
 
@@ -71,10 +59,8 @@ def sanitize(text: str) -> str:
         url = m.group(0)
         try:
             parsed = urllib.parse.urlparse(url)
-            # Decodeer %20 etc. zodat het pad leesbaar is
             path_decoded = urllib.parse.unquote(parsed.path)
             parts = path_decoded.strip("/").split("/")
-            # parts[0] = "sites", parts[1] = sitenaam, parts[2:] = rest van het pad
             if len(parts) >= 2 and parts[0].lower() == "sites":
                 rest = "/" + "/".join(parts[2:]) if len(parts) > 2 else ""
                 masked = f"https://[TENANT].sharepoint.com/sites/[SITE]{rest}"
@@ -121,7 +107,7 @@ class TMSLParser:
 
 
 # ---------------------------------------------------------------------------
-# TMDL parser (.tmdl format — Tabular Model Definition Language)
+# TMDL parser (.tmdl format)
 # ---------------------------------------------------------------------------
 
 class TMLDParser:
@@ -651,7 +637,7 @@ def parse_report_definition(definition_dir: Path) -> dict:
 
 def render_markdown(
     project_name: str,
-    parser,
+    parser,  # Optional — None if no semantic model found
     report_data: Optional[dict],
     model_format: str,
 ) -> str:
@@ -663,152 +649,199 @@ def render_markdown(
     def p(t=""): lines.append(t)
 
     h1(f"Power BI Documentation: {project_name}")
-    p(f"_Semantic model format: **{model_format}**_")
+    if model_format:
+        p(f"_Semantic model format: **{model_format}**_")
+    else:
+        p("_No semantic model found — report-only documentation._")
     p()
 
     h2("Table of Contents")
-    p("1. [Data Model Overview](#data-model-overview)")
-    p("2. [Tables & Columns](#tables--columns)")
-    p("3. [Measure Catalogue](#measure-catalogue)")
-    p("4. [Relationships](#relationships)")
-    if parser.roles():
-        p("5. [Row-Level Security](#row-level-security)")
+    toc_idx = 1
+    if parser:
+        p(f"{toc_idx}. [Data Model Overview](#data-model-overview)"); toc_idx += 1
+        p(f"{toc_idx}. [Tables & Columns](#tables--columns)"); toc_idx += 1
+        p(f"{toc_idx}. [Measure Catalogue](#measure-catalogue)"); toc_idx += 1
+        p(f"{toc_idx}. [Relationships](#relationships)"); toc_idx += 1
+        if parser.roles():
+            p(f"{toc_idx}. [Row-Level Security](#row-level-security)"); toc_idx += 1
     if report_data:
-        p("6. [Report Structure](#report-structure)")
+        p(f"{toc_idx}. [Report Structure](#report-structure)"); toc_idx += 1
     p()
 
-    h2("Data Model Overview")
-    tables = parser.tables()
-    total_measures = sum(len(parser.get_measures(t)) for t in tables)
-    total_columns = sum(len(parser.get_columns(t)) for t in tables)
-    total_rels = len(parser.relationships())
+    if parser:
+        tables = parser.tables()
+        total_measures = sum(len(parser.get_measures(t)) for t in tables)
+        total_columns = sum(len(parser.get_columns(t)) for t in tables)
+        total_rels = len(parser.relationships())
 
-    p(f"| Metric | Count |")
-    p(f"|--------|-------|")
-    p(f"| Tables | {len(tables)} |")
-    p(f"| Columns | {total_columns} |")
-    p(f"| Measures | {total_measures} |")
-    p(f"| Relationships | {total_rels} |")
-    p(f"| RLS Roles | {len(parser.roles())} |")
-    p()
+        h2("Data Model Overview")
+        p(f"| Metric | Count |")
+        p(f"|--------|-------|")
+        p(f"| Tables | {len(tables)} |")
+        p(f"| Columns | {total_columns} |")
+        p(f"| Measures | {total_measures} |")
+        p(f"| Relationships | {total_rels} |")
+        p(f"| RLS Roles | {len(parser.roles())} |")
+        p()
 
-    h2("Tables & Columns")
-    for table in tables:
-        table_name = table.get("name", "Unknown")
-        h3(table_name)
+        h2("Tables & Columns")
+        for table in tables:
+            table_name = table.get("name", "Unknown")
+            h3(table_name)
 
-        columns = parser.get_columns(table)
-        measures = parser.get_measures(table)
-        partitions = parser.get_partitions(table)
+            columns = parser.get_columns(table)
+            measures = parser.get_measures(table)
+            partitions = parser.get_partitions(table)
 
-        if partitions:
-            source_info = ""
-            for pt in partitions:
-                source = pt.get("source", {})
-                if isinstance(source, dict):
-                    query = source.get("query", source.get("expression", ""))
-                    if query:
-                        # ↓ sanitize vóór output
-                        query_clean = sanitize(query)
-                        source_info = f"`{query_clean[:120]}{'...' if len(query_clean) > 120 else ''}`"
-            if source_info:
-                p(f"**Source:** {source_info}")
+            if partitions:
+                source_info = ""
+                for pt in partitions:
+                    source = pt.get("source", {})
+                    if isinstance(source, dict):
+                        query = source.get("query", source.get("expression", ""))
+                        if query:
+                            query_clean = sanitize(query)
+                            source_info = f"`{query_clean[:120]}{'...' if len(query_clean) > 120 else ''}`"
+                if source_info:
+                    p(f"**Source:** {source_info}")
+                    p()
+
+            if columns:
+                p("| Column | Data Type | Hidden | Description |")
+                p("|--------|-----------|--------|-------------|")
+                for col in columns:
+                    name = col.get("name", "")
+                    dtype = col.get("dataType", col.get("type", "unknown"))
+                    hidden = "✓" if col.get("isHidden") else ""
+                    desc = col.get("description", "")
+                    p(f"| {name} | {dtype} | {hidden} | {desc} |")
+                p()
+            else:
+                p("_No columns defined (may be a calculated or virtual table)._")
                 p()
 
-        if columns:
-            p("| Column | Data Type | Hidden | Description |")
-            p("|--------|-----------|--------|-------------|")
-            for col in columns:
-                name = col.get("name", "")
-                dtype = col.get("dataType", col.get("type", "unknown"))
-                hidden = "✓" if col.get("isHidden") else ""
-                desc = col.get("description", "")
-                p(f"| {name} | {dtype} | {hidden} | {desc} |")
+            if measures:
+                p(f"**{len(measures)} measure(s)** — see Measure Catalogue below.")
+                p()
+
+        h2("Measure Catalogue")
+        has_measures = False
+        for table in tables:
+            measures = parser.get_measures(table)
+            if not measures:
+                continue
+            has_measures = True
+            table_name = table.get("name", "Unknown")
+            h3(f"Table: {table_name}")
+
+            for measure in measures:
+                name = measure.get("name", "")
+                dax = measure.get("expression", "").strip()
+                desc = measure.get("description", "")
+                fmt = measure.get("formatString", "")
+
+                p(f"#### `{name}`")
+                if desc:
+                    p(f"_{desc}_")
+                    p()
+                if fmt:
+                    p(f"**Format:** `{fmt}`")
+                    p()
+                if dax:
+                    p("```dax")
+                    p(sanitize(dax))
+                    p("```")
+                else:
+                    p("_No DAX expression found._")
+                p()
+
+        if not has_measures:
+            p("_No measures found in this model._")
+            p()
+
+        h2("Relationships")
+        rels = parser.relationships()
+        if rels:
+            p("| From Table | From Column | To Table | To Column | Cardinality | Cross Filter |")
+            p("|------------|-------------|----------|-----------|-------------|--------------|")
+            for rel in rels:
+                from_t = rel.get("fromTable", rel.get("fromTableId", ""))
+                from_c = rel.get("fromColumn", rel.get("fromColumnId", ""))
+                to_t = rel.get("toTable", rel.get("toTableId", ""))
+                to_c = rel.get("toColumn", rel.get("toColumnId", ""))
+                card = rel.get("cardinality", "many-to-one")
+                cf = rel.get("crossFilter", rel.get("crossFilteringBehavior", ""))
+                p(f"| {from_t} | {from_c} | {to_t} | {to_c} | {card} | {cf} |")
             p()
         else:
-            p("_No columns defined (may be a calculated or virtual table)._")
+            p("_No relationships defined._")
             p()
 
-        if measures:
-            p(f"**{len(measures)} measure(s)** — see Measure Catalogue below.")
-            p()
+        roles = parser.roles()
+        if roles:
+            h2("Row-Level Security")
+            for role in roles:
+                role_name = role.get("name", "")
+                h3(role_name)
+                members = role.get("members", [])
+                if members:
+                    p(f"**Members:** {', '.join(str(m) for m in members)}")
+                    p()
+                perms = role.get("tablePermissions", [])
+                model_perms = role.get("modelPermission", "")
+                if model_perms:
+                    p(f"**Model permission:** `{model_perms}`")
+                    p()
+                if perms:
+                    p("| Table | Filter Expression |")
+                    p("|-------|------------------|")
+                    for perm in perms:
+                        t = perm.get("table", perm.get("name", ""))
+                        expr = perm.get("filterExpression", perm.get("expression", "_none_"))
+                        p(f"| {t} | `{expr}` |")
+                    p()
 
-    h2("Measure Catalogue")
-    has_measures = False
-    for table in tables:
-        measures = parser.get_measures(table)
-        if not measures:
-            continue
-        has_measures = True
-        table_name = table.get("name", "Unknown")
-        h3(f"Table: {table_name}")
-
-        for measure in measures:
-            name = measure.get("name", "")
-            dax = measure.get("expression", "").strip()
-            desc = measure.get("description", "")
-            fmt = measure.get("formatString", "")
-
-            p(f"#### `{name}`")
-            if desc:
-                p(f"_{desc}_")
+        h2("Power Query (M) Sources")
+        has_pq = False
+        for table in tables:
+            partitions = parser.get_partitions(table)
+            for pt in partitions:
+                source = pt.get("source", {})
+                expr = source.get("expression", "") if isinstance(source, dict) else source
+                if not expr:
+                    continue
+                has_pq = True
+                table_name = table.get("name", "Unknown")
+                h3(table_name)
+                p(f"**Mode:** `{pt.get('mode', 'import')}`")
                 p()
-            if fmt:
-                p(f"**Format:** `{fmt}`")
-                p()
-            if dax:
-                p("```dax")
-                # DAX bevat normaal geen URLs, maar voor de zekerheid
-                p(sanitize(dax))
+                p("```powerquery")
+                p(sanitize(expr.strip()))
                 p("```")
-            else:
-                p("_No DAX expression found._")
+                p()
+
+        if not has_pq:
+            p("_No Power Query expressions found (model may use DirectQuery or live connection)._")
             p()
 
-    if not has_measures:
-        p("_No measures found in this model._")
-        p()
-
-    h2("Relationships")
-    rels = parser.relationships()
-    if rels:
-        p("| From Table | From Column | To Table | To Column | Cardinality | Cross Filter |")
-        p("|------------|-------------|----------|-----------|-------------|--------------|")
-        for rel in rels:
-            from_t = rel.get("fromTable", rel.get("fromTableId", ""))
-            from_c = rel.get("fromColumn", rel.get("fromColumnId", ""))
-            to_t = rel.get("toTable", rel.get("toTableId", ""))
-            to_c = rel.get("toColumn", rel.get("toColumnId", ""))
-            card = rel.get("cardinality", "many-to-one")
-            cf = rel.get("crossFilter", rel.get("crossFilteringBehavior", ""))
-            p(f"| {from_t} | {from_c} | {to_t} | {to_c} | {card} | {cf} |")
-        p()
-    else:
-        p("_No relationships defined._")
-        p()
-
-    roles = parser.roles()
-    if roles:
-        h2("Row-Level Security")
-        for role in roles:
-            role_name = role.get("name", "")
-            h3(role_name)
-            members = role.get("members", [])
-            if members:
-                p(f"**Members:** {', '.join(str(m) for m in members)}")
-                p()
-            perms = role.get("tablePermissions", [])
-            model_perms = role.get("modelPermission", "")
-            if model_perms:
-                p(f"**Model permission:** `{model_perms}`")
-                p()
-            if perms:
-                p("| Table | Filter Expression |")
-                p("|-------|------------------|")
-                for perm in perms:
-                    t = perm.get("table", perm.get("name", ""))
-                    expr = perm.get("filterExpression", perm.get("expression", "_none_"))
-                    p(f"| {t} | `{expr}` |")
+        shared = parser.shared_expressions()
+        if shared:
+            h2("Shared Power Query Functions & Parameters")
+            p("These are reusable queries/functions defined in `expressions.tmdl`, "
+              "typically used as helper functions called from table queries above.")
+            p()
+            for expr in shared:
+                name = expr.get("name", "")
+                kind = expr.get("kind", "")
+                body = expr.get("expression", "").strip()
+                h3(name)
+                if kind:
+                    p(f"**Kind:** `{kind}`")
+                    p()
+                if body:
+                    p("```powerquery")
+                    p(sanitize(body))
+                    p("```")
                 p()
 
     if report_data:
@@ -849,51 +882,6 @@ def render_markdown(
                 else:
                     p("_No field bindings extracted._")
                 p()
-
-    h2("Power Query (M) Sources")
-    has_pq = False
-    for table in tables:
-        partitions = parser.get_partitions(table)
-        for pt in partitions:
-            source = pt.get("source", {})
-            expr = source.get("expression", "") if isinstance(source, dict) else source
-            if not expr:
-                continue
-            has_pq = True
-            table_name = table.get("name", "Unknown")
-            h3(table_name)
-            p(f"**Mode:** `{pt.get('mode', 'import')}`")
-            p()
-            p("```powerquery")
-            # ↓ sanitize vóór output
-            p(sanitize(expr.strip()))
-            p("```")
-            p()
-
-    if not has_pq:
-        p("_No Power Query expressions found (model may use DirectQuery or live connection)._")
-        p()
-
-    shared = parser.shared_expressions()
-    if shared:
-        h2("Shared Power Query Functions & Parameters")
-        p("These are reusable queries/functions defined in `expressions.tmdl`, "
-          "typically used as helper functions called from table queries above.")
-        p()
-        for expr in shared:
-            name = expr.get("name", "")
-            kind = expr.get("kind", "")
-            body = expr.get("expression", "").strip()
-            h3(name)
-            if kind:
-                p(f"**Kind:** `{kind}`")
-                p()
-            if body:
-                p("```powerquery")
-                # ↓ sanitize vóór output
-                p(sanitize(body))
-                p("```")
-            p()
 
     p("---")
     p("_Generated by pbip_document.py_")
@@ -980,242 +968,283 @@ def describe_dax(dax: str) -> str:
 
 def render_copilot_kb(
     project_name: str,
-    parser,
+    parser,  # Optional — None if no semantic model found
     report_data: Optional[dict],
     model_format: str,
 ) -> str:
-    tables = parser.tables()
+    tables = parser.tables() if parser else []
     all_table_names = [t.get("name", "") for t in tables]
     all_measure_names = [
         m.get("name", "")
         for t in tables
         for m in parser.get_measures(t)
-    ]
+    ] if parser else []
 
     lines: list[str] = []
     def w(s=""): lines.append(s)
 
     w("=" * 80)
     w(f"POWER BI KNOWLEDGE BASE: {project_name.upper()}")
-    w(f"Semantic model format: {model_format}")
+    if model_format:
+        w(f"Semantic model format: {model_format}")
+    else:
+        w("No semantic model — report-only documentation.")
     w("=" * 80)
     w()
     w("INSTRUCTIONS FOR AI ASSISTANT")
     w("-" * 40)
     w("This file is the complete technical knowledge base for the Power BI project")
     w(f'"{project_name}". Use it to answer questions about:')
-    w("- How specific measures or fields are calculated (including full DAX logic)")
-    w("- What columns exist in which tables and what they represent")
-    w("- How tables are related to each other")
-    w("- Which measures depend on other measures or columns")
+    if parser:
+        w("- How specific measures or fields are calculated (including full DAX logic)")
+        w("- What columns exist in which tables and what they represent")
+        w("- How tables are related to each other")
+        w("- Which measures depend on other measures or columns")
     w("- Which pages and visuals exist in the report, and which fields each visual uses")
-    w()
-    w("When answering questions about a measure, always explain:")
-    w("1. What the measure calculates in plain language")
-    w("2. The exact DAX formula")
-    w("3. Which tables and columns it touches")
-    w("4. Which other measures it calls (if any)")
-    w("5. Which report visuals use this measure (if applicable)")
     w()
 
     w("=" * 80)
     w("INDEX")
     w("=" * 80)
-    w(f"Tables ({len(tables)}): " + ", ".join(all_table_names))
-    w(f"Total columns: {sum(len(parser.get_columns(t)) for t in tables)}")
-    w(f"Total measures: {len(all_measure_names)}")
-    w(f"Relationships: {len(parser.relationships())}")
-    w(f"RLS Roles: {len(parser.roles())}")
+    if parser:
+        w(f"Tables ({len(tables)}): " + ", ".join(all_table_names))
+        w(f"Total columns: {sum(len(parser.get_columns(t)) for t in tables)}")
+        w(f"Total measures: {len(all_measure_names)}")
+        w(f"Relationships: {len(parser.relationships())}")
+        w(f"RLS Roles: {len(parser.roles())}")
+    else:
+        w("No semantic model available.")
     if report_data:
         pages = report_data.get("pages", [])
         total_visuals = sum(len(p.get("visuals", [])) for p in pages)
         w(f"Report pages: {len(pages)} ({total_visuals} visuals total)")
     w()
 
-    w("=" * 80)
-    w("SECTION 1: TABLES AND COLUMNS")
-    w("=" * 80)
-    w()
-
-    for table in tables:
-        table_name = table.get("name", "Unknown")
-        columns = parser.get_columns(table)
-        measures = parser.get_measures(table)
-        partitions = parser.get_partitions(table)
-
-        w(f"TABLE: {table_name}")
-        w("-" * 60)
-
-        for pt in partitions:
-            source = pt.get("source", {})
-            if isinstance(source, dict):
-                query = source.get("query", source.get("expression", ""))
-                if query:
-                    w(f"This table is loaded from the following query:")
-                    # ↓ sanitize vóór output
-                    w(sanitize(query.strip()))
-                    w()
-
-        if columns:
-            w(f"This table has {len(columns)} column(s):")
-            w()
-            for col in columns:
-                col_name = col.get("name", "")
-                dtype = col.get("dataType", col.get("type", "unknown"))
-                desc = col.get("description", "")
-                hidden = col.get("isHidden", False)
-
-                line = f'  Column "{col_name}" (data type: {dtype})'
-                if hidden:
-                    line += " [hidden from report view]"
-                if desc:
-                    line += f": {desc}"
-                w(line)
-        else:
-            w("This table has no regular columns (may be a calculated or virtual table).")
-
-        if measures:
-            w()
-            w(f"This table contains {len(measures)} measure(s): "
-              + ", ".join(f'"{m.get("name", "")}"' for m in measures))
-
+    if parser:
+        w("=" * 80)
+        w("SECTION 1: TABLES AND COLUMNS")
+        w("=" * 80)
         w()
 
-    w("=" * 80)
-    w("SECTION 2: MEASURES (FULL DAX AND DEPENDENCIES)")
-    w("=" * 80)
-    w()
+        for table in tables:
+            table_name = table.get("name", "Unknown")
+            columns = parser.get_columns(table)
+            measures = parser.get_measures(table)
+            partitions = parser.get_partitions(table)
 
-    measure_visual_usage: dict[str, list[str]] = {}
-    if report_data:
-        for page in report_data.get("pages", []):
-            page_name = page["name"]
-            for visual in page.get("visuals", []):
-                vtype = visual["visualType"]
-                title = visual.get("title", "")
-                label = f'"{title}" ({vtype}) on page "{page_name}"' if title else f'{vtype} on page "{page_name}"'
-                for f in visual.get("fields", []):
-                    field_str = f.get("field", "")
-                    m = re.search(r"\[([^\]]+)\]", field_str)
-                    if m:
-                        fname = m.group(1)
-                        if fname in all_measure_names:
-                            measure_visual_usage.setdefault(fname, []).append(label)
-
-    for table in tables:
-        measures = parser.get_measures(table)
-        if not measures:
-            continue
-        table_name = table.get("name", "Unknown")
-
-        for measure in measures:
-            name = measure.get("name", "")
-            dax = measure.get("expression", "").strip()
-            desc = measure.get("description", "")
-            fmt = measure.get("formatString", "")
-
-            w(f"MEASURE: {name}")
-            w(f"Defined in table: {table_name}")
+            w(f"TABLE: {table_name}")
             w("-" * 60)
 
-            if desc:
-                w(f"Description: {desc}")
-            if fmt:
-                w(f"Display format: {fmt}")
+            for pt in partitions:
+                source = pt.get("source", {})
+                if isinstance(source, dict):
+                    query = source.get("query", source.get("expression", ""))
+                    if query:
+                        w(f"This table is loaded from the following query:")
+                        w(sanitize(query.strip()))
+                        w()
 
-            if dax:
-                plain = describe_dax(dax)
-                w(f"What it does: {plain}")
-            w()
-
-            if dax:
-                w("Full DAX formula:")
-                # ↓ sanitize vóór output
-                w(sanitize(dax))
+            if columns:
+                w(f"This table has {len(columns)} column(s):")
                 w()
+                for col in columns:
+                    col_name = col.get("name", "")
+                    dtype = col.get("dataType", col.get("type", "unknown"))
+                    desc = col.get("description", "")
+                    hidden = col.get("isHidden", False)
 
-                deps = extract_dax_refs(dax, all_table_names, all_measure_names)
-
-                if deps["measures"]:
-                    w("This measure calls the following other measures:")
-                    for m in deps["measures"]:
-                        if m != name:
-                            w(f'  - "{m}"')
-                    w()
-
-                if deps["columns"]:
-                    w("This measure references the following columns:")
-                    for c in deps["columns"]:
-                        w(f"  - {c}")
-                    w()
-
-                if deps["tables"]:
-                    w("This measure references the following tables:")
-                    for t in deps["tables"]:
-                        w(f"  - {t}")
-                    w()
+                    line = f'  Column "{col_name}" (data type: {dtype})'
+                    if hidden:
+                        line += " [hidden from report view]"
+                    if desc:
+                        line += f": {desc}"
+                    w(line)
             else:
-                w("No DAX expression was found for this measure.")
-                w()
+                w("This table has no regular columns (may be a calculated or virtual table).")
 
-            usages = measure_visual_usage.get(name, [])
-            if usages:
-                w(f"This measure is used in {len(usages)} visual(s):")
-                for usage in usages:
-                    w(f"  - {usage}")
+            if measures:
                 w()
+                w(f"This table contains {len(measures)} measure(s): "
+                  + ", ".join(f'"{m.get("name", "")}"' for m in measures))
 
             w()
 
-    w("=" * 80)
-    w("SECTION 3: RELATIONSHIPS")
-    w("=" * 80)
-    w()
-
-    rels = parser.relationships()
-    if rels:
-        w(f"The data model has {len(rels)} relationship(s):")
-        w()
-        for i, rel in enumerate(rels, 1):
-            from_t = rel.get("fromTable", rel.get("fromTableId", ""))
-            from_c = rel.get("fromColumn", rel.get("fromColumnId", ""))
-            to_t = rel.get("toTable", rel.get("toTableId", ""))
-            to_c = rel.get("toColumn", rel.get("toColumnId", ""))
-            card = rel.get("cardinality", rel.get("fromCardinality", "many-to-one"))
-            cf = rel.get("crossFilter", rel.get("crossFilteringBehavior", "single"))
-
-            w(f"Relationship {i}:")
-            w(f'  The column "{from_c}" in table "{from_t}" is linked to '
-              f'the column "{to_c}" in table "{to_t}".')
-            w(f"  Cardinality: {card}. Cross-filter direction: {cf}.")
-            w()
-    else:
-        w("No relationships are defined in this model.")
-        w()
-
-    roles = parser.roles()
-    if roles:
         w("=" * 80)
-        w("SECTION 4: ROW-LEVEL SECURITY (RLS)")
+        w("SECTION 2: MEASURES (FULL DAX AND DEPENDENCIES)")
         w("=" * 80)
         w()
-        for role in roles:
-            role_name = role.get("name", "")
-            perms = role.get("tablePermissions", [])
-            w(f"RLS Role: {role_name}")
-            if perms:
-                for perm in perms:
-                    t = perm.get("table", perm.get("name", ""))
-                    expr = perm.get("filterExpression", perm.get("expression", ""))
-                    if expr:
-                        w(f'  Table "{t}" is filtered by: {expr}')
-                    else:
-                        w(f'  Table "{t}" is included in this role (no filter expression).')
+
+        measure_visual_usage: dict[str, list[str]] = {}
+        if report_data:
+            for page in report_data.get("pages", []):
+                page_name = page["name"]
+                for visual in page.get("visuals", []):
+                    vtype = visual["visualType"]
+                    title = visual.get("title", "")
+                    label = f'"{title}" ({vtype}) on page "{page_name}"' if title else f'{vtype} on page "{page_name}"'
+                    for f in visual.get("fields", []):
+                        field_str = f.get("field", "")
+                        m = re.search(r"\[([^\]]+)\]", field_str)
+                        if m:
+                            fname = m.group(1)
+                            if fname in all_measure_names:
+                                measure_visual_usage.setdefault(fname, []).append(label)
+
+        for table in tables:
+            measures = parser.get_measures(table)
+            if not measures:
+                continue
+            table_name = table.get("name", "Unknown")
+
+            for measure in measures:
+                name = measure.get("name", "")
+                dax = measure.get("expression", "").strip()
+                desc = measure.get("description", "")
+                fmt = measure.get("formatString", "")
+
+                w(f"MEASURE: {name}")
+                w(f"Defined in table: {table_name}")
+                w("-" * 60)
+
+                if desc:
+                    w(f"Description: {desc}")
+                if fmt:
+                    w(f"Display format: {fmt}")
+
+                if dax:
+                    plain = describe_dax(dax)
+                    w(f"What it does: {plain}")
+                w()
+
+                if dax:
+                    w("Full DAX formula:")
+                    w(sanitize(dax))
+                    w()
+
+                    deps = extract_dax_refs(dax, all_table_names, all_measure_names)
+
+                    if deps["measures"]:
+                        w("This measure calls the following other measures:")
+                        for m in deps["measures"]:
+                            if m != name:
+                                w(f'  - "{m}"')
+                        w()
+
+                    if deps["columns"]:
+                        w("This measure references the following columns:")
+                        for c in deps["columns"]:
+                            w(f"  - {c}")
+                        w()
+
+                    if deps["tables"]:
+                        w("This measure references the following tables:")
+                        for t in deps["tables"]:
+                            w(f"  - {t}")
+                        w()
+                else:
+                    w("No DAX expression was found for this measure.")
+                    w()
+
+                usages = measure_visual_usage.get(name, [])
+                if usages:
+                    w(f"This measure is used in {len(usages)} visual(s):")
+                    for usage in usages:
+                        w(f"  - {usage}")
+                    w()
+
+                w()
+
+        w("=" * 80)
+        w("SECTION 3: RELATIONSHIPS")
+        w("=" * 80)
+        w()
+
+        rels = parser.relationships()
+        if rels:
+            w(f"The data model has {len(rels)} relationship(s):")
             w()
+            for i, rel in enumerate(rels, 1):
+                from_t = rel.get("fromTable", rel.get("fromTableId", ""))
+                from_c = rel.get("fromColumn", rel.get("fromColumnId", ""))
+                to_t = rel.get("toTable", rel.get("toTableId", ""))
+                to_c = rel.get("toColumn", rel.get("toColumnId", ""))
+                card = rel.get("cardinality", rel.get("fromCardinality", "many-to-one"))
+                cf = rel.get("crossFilter", rel.get("crossFilteringBehavior", "single"))
+
+                w(f"Relationship {i}:")
+                w(f'  The column "{from_c}" in table "{from_t}" is linked to '
+                  f'the column "{to_c}" in table "{to_t}".')
+                w(f"  Cardinality: {card}. Cross-filter direction: {cf}.")
+                w()
+        else:
+            w("No relationships are defined in this model.")
+            w()
+
+        roles = parser.roles()
+        if roles:
+            w("=" * 80)
+            w("SECTION 4: ROW-LEVEL SECURITY (RLS)")
+            w("=" * 80)
+            w()
+            for role in roles:
+                role_name = role.get("name", "")
+                perms = role.get("tablePermissions", [])
+                w(f"RLS Role: {role_name}")
+                if perms:
+                    for perm in perms:
+                        t = perm.get("table", perm.get("name", ""))
+                        expr = perm.get("filterExpression", perm.get("expression", ""))
+                        if expr:
+                            w(f'  Table "{t}" is filtered by: {expr}')
+                        else:
+                            w(f'  Table "{t}" is included in this role (no filter expression).')
+                w()
+
+        w("=" * 80)
+        w("SECTION 5: POWER QUERY (M) SOURCES")
+        w("=" * 80)
+        w()
+
+        has_pq = False
+        for table in tables:
+            partitions = parser.get_partitions(table)
+            for pt in partitions:
+                source = pt.get("source", {})
+                expr = source.get("expression", "") if isinstance(source, dict) else source
+                if not expr:
+                    continue
+                has_pq = True
+                table_name = table.get("name", "Unknown")
+                w(f"Table: {table_name} (mode: {pt.get('mode', 'import')})")
+                w("-" * 60)
+                w("Power Query expression:")
+                w(sanitize(expr.strip()))
+                w()
+
+        if not has_pq:
+            w("No Power Query expressions found (model may use DirectQuery or live connection).")
+            w()
+
+        shared = parser.shared_expressions()
+        if shared:
+            w("=" * 80)
+            w("SECTION 6: SHARED POWER QUERY FUNCTIONS AND PARAMETERS")
+            w("=" * 80)
+            w()
+            for expr in shared:
+                name = expr.get("name", "")
+                kind = expr.get("kind", "")
+                body = expr.get("expression", "").strip()
+                w(f"Shared expression: {name} (kind: {kind})")
+                w("-" * 60)
+                if body:
+                    w(sanitize(body))
+                w()
 
     if report_data:
+        report_section_num = "SECTION 7" if parser else "SECTION 1"
         w("=" * 80)
-        w("SECTION 5: REPORT STRUCTURE AND VISUAL FIELD BINDINGS")
+        w(f"{report_section_num}: REPORT STRUCTURE AND VISUAL FIELD BINDINGS")
         w("=" * 80)
         w()
         pages = report_data.get("pages", [])
@@ -1253,49 +1282,6 @@ def render_copilot_kb(
                 else:
                     w("    No field bindings extracted.")
                 w()
-
-    w("=" * 80)
-    w("SECTION 6: POWER QUERY (M) SOURCES")
-    w("=" * 80)
-    w()
-
-    has_pq = False
-    for table in tables:
-        partitions = parser.get_partitions(table)
-        for pt in partitions:
-            source = pt.get("source", {})
-            expr = source.get("expression", "") if isinstance(source, dict) else source
-            if not expr:
-                continue
-            has_pq = True
-            table_name = table.get("name", "Unknown")
-            w(f"Table: {table_name} (mode: {pt.get('mode', 'import')})")
-            w("-" * 60)
-            w("Power Query expression:")
-            # ↓ sanitize vóór output
-            w(sanitize(expr.strip()))
-            w()
-
-    if not has_pq:
-        w("No Power Query expressions found (model may use DirectQuery or live connection).")
-        w()
-
-    shared = parser.shared_expressions()
-    if shared:
-        w("=" * 80)
-        w("SECTION 7: SHARED POWER QUERY FUNCTIONS AND PARAMETERS")
-        w("=" * 80)
-        w()
-        for expr in shared:
-            name = expr.get("name", "")
-            kind = expr.get("kind", "")
-            body = expr.get("expression", "").strip()
-            w(f"Shared expression: {name} (kind: {kind})")
-            w("-" * 60)
-            if body:
-                # ↓ sanitize vóór output
-                w(sanitize(body))
-            w()
 
     w("=" * 80)
     w("END OF KNOWLEDGE BASE")
@@ -1341,13 +1327,29 @@ def find_report_definition_dir(pbip_root: Path) -> Optional[Path]:
     return None
 
 
+def derive_project_name(pbip_root: Path) -> str:
+    """
+    Derive a readable project name from the folder structure.
+    Handles both:
+      - MyReport.pbip  (folder named after the project)
+      - MyReport.Report (standalone report folder without .pbip wrapper)
+    """
+    name = pbip_root.name
+    # Strip known Power BI suffixes
+    for suffix in (".pbip", ".Report", ".SemanticModel", ".DataModel"):
+        if name.endswith(suffix):
+            name = name[: -len(suffix)]
+            break
+    return name.replace("_", " ").replace("-", " ").title()
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main():
-    ap = argparse.ArgumentParser(description="Document a Power BI .pbip project")
-    ap.add_argument("pbip_path", help="Path to the .pbip project folder")
+    ap = argparse.ArgumentParser(description="Document a Power BI .pbip project or standalone Report folder")
+    ap.add_argument("pbip_path", help="Path to the .pbip project folder or a standalone .Report folder")
     ap.add_argument("--output", "-o", default="", help="Output file path")
     ap.add_argument(
         "--copilot",
@@ -1364,20 +1366,22 @@ def main():
         print(f"ERROR: Path does not exist: {pbip_root}", file=sys.stderr)
         sys.exit(1)
 
-    project_name = pbip_root.name.replace(".pbip", "").replace("_", " ").title()
+    project_name = derive_project_name(pbip_root)
 
+    # --- Semantic model (optional) ---
     model_path, model_format = find_semantic_model(pbip_root)
-    if not model_path:
-        print("ERROR: No semantic model found (.bim or TMDL definition folder).", file=sys.stderr)
-        sys.exit(1)
+    parser = None
 
-    print(f"Found semantic model ({model_format}): {model_path}")
-
-    if model_format == "TMSL":
-        parser = TMSLParser(model_path)
+    if model_path:
+        print(f"Found semantic model ({model_format}): {model_path}")
+        if model_format == "TMSL":
+            parser = TMSLParser(model_path)
+        else:
+            parser = TMLDParser(model_path)
     else:
-        parser = TMLDParser(model_path)
+        print("No semantic model found — continuing with report-only documentation.")
 
+    # --- Report ---
     report_data = None
 
     report_def_dir = find_report_definition_dir(pbip_root)
@@ -1399,6 +1403,10 @@ def main():
         else:
             print("No report found — skipping report structure section.")
 
+    if not parser and not report_data:
+        print("ERROR: Neither a semantic model nor a report was found in the specified folder.", file=sys.stderr)
+        sys.exit(1)
+
     if report_data and report_data.get("pages"):
         total_visuals = sum(len(p.get("visuals", [])) for p in report_data["pages"])
         total_fields = sum(
@@ -1408,8 +1416,12 @@ def main():
         )
         print(f"  Pages: {len(report_data['pages'])}, Visuals: {total_visuals}, Field bindings: {total_fields}")
 
-    tables = parser.tables()
-    n_measures = sum(len(parser.get_measures(t)) for t in tables)
+    n_measures = 0
+    n_tables = 0
+    if parser:
+        tables = parser.tables()
+        n_tables = len(tables)
+        n_measures = sum(len(parser.get_measures(t)) for t in tables)
 
     if args.copilot:
         content = render_copilot_kb(project_name, parser, report_data, model_format)
@@ -1420,14 +1432,17 @@ def main():
         default_name = f"{project_name.replace(' ', '_')}_docs.md"
         suffix = "Markdown documentation"
 
-    output_path = args.output or default_name
+    output_path = args.output or (Path.cwd() / default_name)
     out = Path(output_path)
     out.write_text(content, encoding="utf-8")
 
     print(f"\nDone. {suffix} written to: {out.resolve()}")
-    print(f"  Tables:        {len(tables)}")
-    print(f"  Measures:      {n_measures}")
-    print(f"  Relationships: {len(parser.relationships())}")
+    if parser:
+        print(f"  Tables:        {n_tables}")
+        print(f"  Measures:      {n_measures}")
+        print(f"  Relationships: {len(parser.relationships())}")
+    else:
+        print("  (No semantic model — report structure only)")
 
     if args.copilot:
         size_kb = out.stat().st_size / 1024
