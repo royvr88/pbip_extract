@@ -2,6 +2,8 @@
 
 A command-line tool that generates documentation from a Power BI Project (`.pbip`) folder.
 
+> Gebruik de GUI (`pbip_gui.py`) voor een gebruiksvriendelijke interface zonder commandoregel.
+
 Supports both **TMSL** (`.bim`) and **TMDL** (`.tmdl`) semantic model formats.
 
 ## Output modes
