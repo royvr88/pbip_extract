@@ -73,3 +73,7 @@ MyReport/
 └── SemanticModel/
     └── model.bim             # TMSL layout (classic PBIP)
 ```
+
+## Roadmap
+- GUI-ondersteuning voor gebruiksvriendelijke invoer
+- Visuele rapportage in de kennisbank
