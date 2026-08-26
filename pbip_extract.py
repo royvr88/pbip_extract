@@ -199,7 +199,10 @@ class TMLDParser:
 
         header = lines[i].strip()
         if header.startswith("table "):
-            table["name"] = header[6:].strip()
+            # TMDL quotes names that contain spaces/special characters, e.g.
+            # table 'Beoordelingen - laatste 4 jaar' — strip that quoting so
+            # the logical name doesn't end up with literal quote characters in it.
+            table["name"] = header[6:].strip().strip("'")
         else:
             table["name"] = path.stem
         i += 1
