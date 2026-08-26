@@ -78,11 +78,20 @@ _INFRA_KEY_PLACEHOLDERS = {
     "siteid": "SHAREPOINT_SITE_ID",
 }
 
+
+# The value itself is restricted to identifier-ish characters (letters, digits,
+# underscore, dot, hyphen — covers hostnames and GUIDs) with NO spaces or quotes
+# allowed. This matters: a greedy/lazy "anything but a few delimiters" value class
+# would, for a key name that also happens to be an ordinary business/column name
+# (e.g. WarehouseId inside a passthrough SQL string like
+# [Query="SELECT * FROM T WHERE WarehouseId = 5 AND Status = 'Open'"]), keep
+# consuming through spaces and text until the next delimiter — swallowing the rest
+# of the SQL and corrupting the output. Real infra values never contain spaces, so
+# stopping at the first non-identifier character is both safe and sufficient.
 _INFRA_KV_RE = re.compile(
     r'\b(' + "|".join(re.escape(k) for k in _INFRA_KEY_PLACEHOLDERS) + r')'
     r'(\s*[:=]\s*)'
-    r'"?([^",\]\)\r\n]+?)"?'
-    r'(?=[,\]\)\r\n]|\s*$)',
+    r'"?([A-Za-z0-9_.\-]+)"?',
     re.IGNORECASE,
 )
 
@@ -92,8 +101,9 @@ _INFRA_KV_RE = re.compile(
 # as a standalone parameter/let-step assignment that starts its own line
 # (e.g. "    schema = "brons_lh","), never as a field inside a "[...]" record literal —
 # those are always written inline (Schema="dbo",Item=...) rather than starting a line.
+# Same identifier-only value class as _INFRA_KV_RE, for the same over-matching reason.
 _SCHEMA_ASSIGN_RE = re.compile(
-    r'(?im)^(\s*)schema(\s*[:=]\s*)"?([^",\]\)\r\n]+?)"?(?=[,\]\)\r\n]|\s*$)',
+    r'(?im)^(\s*)schema(\s*[:=]\s*)"?([A-Za-z0-9_.\-]+)"?',
 )
 
 
@@ -324,6 +334,9 @@ class TMLDParser:
             "formatString:", "lineageTag:", "description:", "displayFolder:",
             "annotation ", "isHidden:", "kpiStatusType:", "dataCategory:",
         )
+        # TMDL's bare-boolean shorthand: a lone property name on its own line means
+        # "= true" (isHidden ⇔ isHidden: true) — also a sibling-property boundary.
+        SIBLING_PROPS_BARE = {"isHidden"}
 
         in_dax = False
 
@@ -338,7 +351,7 @@ class TMLDParser:
                 in_dax = True
                 continue
 
-            if stripped and any(stripped.startswith(p) for p in SIBLING_PROPS):
+            if stripped and (any(stripped.startswith(p) for p in SIBLING_PROPS) or stripped in SIBLING_PROPS_BARE):
                 in_dax = False
                 if stripped.startswith("formatString:"):
                     format_string = stripped.split(":", 1)[1].strip().strip("'\"")
@@ -375,7 +388,16 @@ class TMLDParser:
             "annotation ", "isHidden:", "formatString:", "summarizeBy:",
             "sourceColumn:", "isDataTypeInferred:", "sortByColumn:",
             "dataCategory:", "isNameInferred:", "isKey:", "isUnique:",
+            "isAvailableInMdx:", "keepUniqueRows:", "isNullable:",
+            "encoding:", "state:", "changedProperty:", "sourceProviderType:",
+            "alignment:", "formatStringDefinition:",
         )
+        # TMDL's bare-boolean shorthand: a lone property name on its own line means
+        # "= true" (isHidden ⇔ isHidden: true) — also a sibling-property boundary.
+        SIBLING_PROPS_BARE = {
+            "isHidden", "isKey", "isUnique", "isDataTypeInferred", "isNameInferred",
+            "isAvailableInMdx", "keepUniqueRows", "isNullable",
+        }
 
         dax_lines: list[str] = []
         in_dax = False
@@ -390,12 +412,14 @@ class TMLDParser:
                 in_dax = True
                 continue
 
-            if stripped and any(stripped.startswith(p) for p in SIBLING_PROPS):
+            if stripped and (any(stripped.startswith(p) for p in SIBLING_PROPS) or stripped in SIBLING_PROPS_BARE):
                 in_dax = False
                 if stripped.startswith("dataType:"):
                     col["dataType"] = stripped.split(":", 1)[1].strip()
                 elif stripped.startswith("isHidden:"):
                     col["isHidden"] = "true" in stripped.lower()
+                elif stripped == "isHidden":
+                    col["isHidden"] = True
                 elif stripped.startswith("description:"):
                     col["description"] = stripped.split(":", 1)[1].strip().strip("'\"")
                 continue
@@ -419,6 +443,11 @@ class TMLDParser:
         partition: dict = {"name": name, "mode": "import", "source": {}}
         m_lines: list[str] = []
         in_source = False
+        # None = no fence seen yet (or none used); True = opening ``` has been seen
+        # and we're waiting for the matching closing ```. TMDL allows the opening
+        # fence either attached to "source =" on the same line, or on its own line
+        # right after — both must be recognised as *opening*, not closing.
+        fenced = False
 
         for line in block:
             stripped = line.strip()
@@ -426,23 +455,28 @@ class TMLDParser:
                 partition["mode"] = stripped.split(":", 1)[1].strip()
             elif stripped == "source =" or stripped.startswith("source ="):
                 in_source = True
+                fenced = False
                 rest = stripped[len("source ="):].strip()
                 if rest == "```":
-                    # opening fence of a TMDL triple-backtick block; content follows on next lines
+                    # opening fence attached to the "source =" line itself
+                    fenced = True
                     rest = ""
                 else:
                     rest = rest.strip("`")
                 if rest:
                     m_lines.append(rest)
             elif in_source:
-                sibling_keywords = {"mode:", "annotation", "description:", "sourceColumn:", "isHidden:"}
-                if any(stripped.startswith(k) for k in sibling_keywords):
-                    in_source = False
-                    continue
                 if stripped == "```":
-                    # closing fence of a TMDL triple-backtick block
-                    in_source = False
+                    if fenced:
+                        in_source = False  # closing fence
+                    else:
+                        fenced = True  # opening fence on its own line
                     continue
+                if not fenced:
+                    sibling_keywords = {"mode:", "annotation", "description:", "sourceColumn:", "isHidden:"}
+                    if any(stripped.startswith(k) for k in sibling_keywords):
+                        in_source = False
+                        continue
                 # Keep blank lines so multi-step M queries keep their original
                 # spacing instead of being collapsed onto consecutive lines.
                 m_lines.append(stripped)
@@ -1815,14 +1849,23 @@ def generate_rowcount_query(tables: list[dict]) -> str:
 
 def parse_rowcount_file(path: Path) -> dict[str, int]:
     """Parses a DAX Studio / Power BI Desktop result grid pasted as plain text
-    (tab- or comma-separated, header included) into {table_name: row_count}."""
+    (tab-, comma-, or semicolon-separated, header included) into {table_name: row_count}.
+    Semicolon is included because Excel's clipboard/CSV list separator is ";" rather
+    than "," on many regional (e.g. Dutch/German) system locales."""
     text = path.read_text(encoding="utf-8-sig")
     lines = [ln for ln in text.splitlines() if ln.strip()]
     counts: dict[str, int] = {}
     if len(lines) < 2:
         return counts
 
-    delim = "\t" if "\t" in lines[0] else ("," if "," in lines[0] else None)
+    if "\t" in lines[0]:
+        delim = "\t"
+    elif ";" in lines[0]:
+        delim = ";"
+    elif "," in lines[0]:
+        delim = ","
+    else:
+        delim = None
 
     def split(line: str) -> list[str]:
         cols = line.split(delim) if delim else [line]
@@ -1902,7 +1945,7 @@ def main():
         default="",
         help=(
             "Path to a text file with a pasted DAX row-count result (table + row count, "
-            "tab- or comma-separated, header included) to include per-table row counts "
+            "tab-, comma-, or semicolon-separated, header included) to include per-table row counts "
             "in the documentation. Get this file by running the query from "
             "--rowcount-query in Power BI Desktop's DAX query view or DAX Studio and "
             "pasting the result grid into a text file."
