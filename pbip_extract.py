@@ -111,13 +111,37 @@ class TMSLParser:
         return table.get("measures", [])
 
     def get_columns(self, table: dict) -> list[dict]:
-        return [c for c in table.get("columns", []) if c.get("type") != "rowNumber"]
+        result = []
+        for c in table.get("columns", []):
+            if c.get("type") == "rowNumber":
+                continue
+            col = dict(c)
+            raw_expr = c.get("expression", "")
+            expr = "\n".join(raw_expr) if isinstance(raw_expr, list) else str(raw_expr or "")
+            col["expression"] = expr.strip()
+            col["isCalculated"] = c.get("type") == "calculated" or bool(col["expression"])
+            result.append(col)
+        return result
 
     def get_partitions(self, table: dict) -> list[dict]:
         return table.get("partitions", [])
 
     def shared_expressions(self) -> list[dict]:
-        return []
+        """Shared M functions from the model's top-level `expressions` array — parameters
+        are excluded on purpose, since they often carry organisation-specific default
+        values (servers, environments)."""
+        result = []
+        for expr in self._model().get("expressions", []):
+            raw = expr.get("expression", "")
+            text = "\n".join(raw) if isinstance(raw, list) else str(raw)
+            if re.search(r"IsParameterQuery\s*=\s*true", text, re.IGNORECASE):
+                continue
+            result.append({
+                "name": expr.get("name", ""),
+                "kind": expr.get("kind", ""),
+                "expression": text.strip(),
+            })
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -207,12 +231,14 @@ class TMLDParser:
             elif stripped.startswith("column ") and line.startswith("\t") and not line.startswith("\t\t"):
                 flush_block()
                 current_type = "column"
-                current_name = stripped[7:].strip().strip("'")
+                # A calculated column's header is "column Name = <DAX expression>" —
+                # split off the "= ..." part so the name doesn't include the formula.
+                current_name = stripped[7:].split("=")[0].strip().strip("'")
                 current_block = [line]
             elif stripped.startswith("partition ") and line.startswith("\t") and not line.startswith("\t\t"):
                 flush_block()
                 current_type = "partition"
-                current_name = stripped[10:].strip().strip("'")
+                current_name = stripped[10:].split("=")[0].strip().strip("'")
                 current_block = [line]
             elif stripped.startswith("isHidden:") and line.startswith("\t") and not line.startswith("\t\t"):
                 table["isHidden"] = "true" in stripped.lower()
@@ -271,14 +297,56 @@ class TMLDParser:
         }
 
     def _parse_column_block(self, name: str, block: list[str]) -> Optional[dict]:
-        col: dict = {"name": name, "dataType": "unknown", "isHidden": False, "description": ""}
+        col: dict = {
+            "name": name, "dataType": "unknown", "isHidden": False,
+            "description": "", "expression": "", "isCalculated": False,
+        }
+
+        # Sibling properties that can follow a column header — anything else while
+        # in_dax is still open is treated as (part of) a calculated column's DAX formula.
+        SIBLING_PROPS = (
+            "dataType:", "lineageTag:", "description:", "displayFolder:",
+            "annotation ", "isHidden:", "formatString:", "summarizeBy:",
+            "sourceColumn:", "isDataTypeInferred:", "sortByColumn:",
+            "dataCategory:", "isNameInferred:", "isKey:", "isUnique:",
+        )
+
+        dax_lines: list[str] = []
+        in_dax = False
+
         for line in block:
-            if "dataType:" in line:
-                col["dataType"] = line.split(":", 1)[1].strip()
-            elif "isHidden:" in line:
-                col["isHidden"] = "true" in line.lower()
-            elif "description:" in line:
-                col["description"] = line.split(":", 1)[1].strip().strip("'\"")
+            stripped = line.strip()
+
+            if stripped.startswith("column ") and "=" in stripped:
+                inline = stripped.split("=", 1)[1].strip()
+                if inline:
+                    dax_lines.append(inline)
+                in_dax = True
+                continue
+
+            if stripped and any(stripped.startswith(p) for p in SIBLING_PROPS):
+                in_dax = False
+                if stripped.startswith("dataType:"):
+                    col["dataType"] = stripped.split(":", 1)[1].strip()
+                elif stripped.startswith("isHidden:"):
+                    col["isHidden"] = "true" in stripped.lower()
+                elif stripped.startswith("description:"):
+                    col["description"] = stripped.split(":", 1)[1].strip().strip("'\"")
+                continue
+
+            if in_dax:
+                clean = stripped.strip("`").strip()
+                dax_lines.append(clean if clean else "")
+
+        while dax_lines and not dax_lines[0]:
+            dax_lines.pop(0)
+        while dax_lines and not dax_lines[-1]:
+            dax_lines.pop()
+
+        if dax_lines:
+            col["expression"] = "\n".join(dax_lines).strip()
+            col["isCalculated"] = True
+
         return col
 
     def _parse_partition_block(self, name: str, block: list[str]) -> dict:
@@ -292,7 +360,12 @@ class TMLDParser:
                 partition["mode"] = stripped.split(":", 1)[1].strip()
             elif stripped == "source =" or stripped.startswith("source ="):
                 in_source = True
-                rest = stripped[len("source ="):].strip().strip("`")
+                rest = stripped[len("source ="):].strip()
+                if rest == "```":
+                    # opening fence of a TMDL triple-backtick block; content follows on next lines
+                    rest = ""
+                else:
+                    rest = rest.strip("`")
                 if rest:
                     m_lines.append(rest)
             elif in_source:
@@ -300,11 +373,20 @@ class TMLDParser:
                 if any(stripped.startswith(k) for k in sibling_keywords):
                     in_source = False
                     continue
-                clean = stripped.strip("`")
-                if clean:
-                    m_lines.append(clean)
+                if stripped == "```":
+                    # closing fence of a TMDL triple-backtick block
+                    in_source = False
+                    continue
+                # Keep blank lines so multi-step M queries keep their original
+                # spacing instead of being collapsed onto consecutive lines.
+                m_lines.append(stripped)
 
         if m_lines:
+            # Trim leading/trailing blank lines only, keep interior spacing intact.
+            while m_lines and not m_lines[0]:
+                m_lines.pop(0)
+            while m_lines and not m_lines[-1]:
+                m_lines.pop()
             partition["source"] = {"expression": "\n".join(m_lines).strip()}
 
         return partition
@@ -317,16 +399,25 @@ class TMLDParser:
         m_lines: list[str] = []
         in_expr = False
 
+        def flush():
+            if current_name and m_lines:
+                while m_lines and not m_lines[0]:
+                    m_lines.pop(0)
+                while m_lines and not m_lines[-1]:
+                    m_lines.pop()
+                expr_text = "\n".join(m_lines).strip()
+                expressions.append({
+                    "name": current_name,
+                    "kind": current_kind,
+                    "expression": expr_text,
+                    "is_parameter": bool(re.search(r"IsParameterQuery\s*=\s*true", expr_text, re.IGNORECASE)),
+                })
+
         for line in lines:
             stripped = line.strip()
 
             if stripped.startswith("expression "):
-                if current_name and m_lines:
-                    expressions.append({
-                        "name": current_name,
-                        "kind": current_kind,
-                        "expression": "\n".join(m_lines).strip(),
-                    })
+                flush()
                 name_part = stripped[len("expression "):].split("=")[0].strip().strip("'\"")
                 current_name = name_part
                 current_kind = "expression"
@@ -338,22 +429,19 @@ class TMLDParser:
                         m_lines.append(rest)
             elif stripped.startswith("kind:"):
                 current_kind = stripped.split(":", 1)[1].strip()
-            elif in_expr and stripped and not stripped.startswith("kind:") and not stripped.startswith("lineageTag:") and not stripped.startswith("annotation"):
+            elif in_expr and not stripped.startswith("kind:") and not stripped.startswith("lineageTag:") and not stripped.startswith("annotation"):
                 m_lines.append(line.rstrip().strip("`"))
             elif stripped.startswith("lineageTag:") or stripped.startswith("annotation"):
                 in_expr = False
 
-        if current_name and m_lines:
-            expressions.append({
-                "name": current_name,
-                "kind": current_kind,
-                "expression": "\n".join(m_lines).strip(),
-            })
+        flush()
 
         return expressions
 
     def shared_expressions(self) -> list[dict]:
-        return getattr(self, "_shared_expressions", [])
+        """Shared M functions from expressions.tmdl — parameters are excluded on purpose,
+        since they often carry organisation-specific default values (servers, environments)."""
+        return [e for e in getattr(self, "_shared_expressions", []) if not e.get("is_parameter")]
 
     def _parse_relationships(self, path: Path) -> list[dict]:
         lines = self._lines(path)
@@ -434,7 +522,7 @@ class TMLDParser:
         return table.get("measures", [])
 
     def get_columns(self, table: dict) -> list[dict]:
-        return [c for c in table.get("columns", []) if not c.get("isHidden", False) or True]
+        return table.get("columns", [])
 
     def get_partitions(self, table: dict) -> list[dict]:
         return table.get("partitions", [])
@@ -702,29 +790,37 @@ def render_markdown(
         partitions = parser.get_partitions(table)
 
         if partitions:
-            source_info = ""
             for pt in partitions:
                 source = pt.get("source", {})
-                if isinstance(source, dict):
-                    query = source.get("query", source.get("expression", ""))
-                    if query:
-                        # ↓ sanitize vóór output
-                        query_clean = sanitize(query)
-                        source_info = f"`{query_clean[:120]}{'...' if len(query_clean) > 120 else ''}`"
-            if source_info:
-                p(f"**Source:** {source_info}")
-                p()
+                if isinstance(source, dict) and source.get("query", source.get("expression", "")):
+                    mode = pt.get("mode", "import")
+                    p(f"**Source:** Power Query (`{mode}`) — full expression under "
+                      f"[Power Query (M) Sources](#power-query-m-sources).")
+                    p()
+                    break
 
         if columns:
-            p("| Column | Data Type | Hidden | Description |")
-            p("|--------|-----------|--------|-------------|")
+            p("| Column | Data Type | Calculated | Hidden | Description |")
+            p("|--------|-----------|------------|--------|-------------|")
             for col in columns:
                 name = col.get("name", "")
                 dtype = col.get("dataType", col.get("type", "unknown"))
+                calc = "✓" if col.get("isCalculated") else ""
                 hidden = "✓" if col.get("isHidden") else ""
                 desc = col.get("description", "")
-                p(f"| {name} | {dtype} | {hidden} | {desc} |")
+                p(f"| {name} | {dtype} | {calc} | {hidden} | {desc} |")
             p()
+
+            calc_columns = [c for c in columns if c.get("isCalculated") and c.get("expression")]
+            if calc_columns:
+                p("**Calculated column formulas:**")
+                p()
+                for col in calc_columns:
+                    p(f"#### `{col.get('name', '')}` (calculated column)")
+                    p("```dax")
+                    p(sanitize(col["expression"]))
+                    p("```")
+                    p()
         else:
             p("_No columns defined (may be a calculated or virtual table)._")
             p()
@@ -876,9 +972,10 @@ def render_markdown(
 
     shared = parser.shared_expressions()
     if shared:
-        h2("Shared Power Query Functions & Parameters")
+        h2("Shared Power Query Functions")
         p("These are reusable queries/functions defined in `expressions.tmdl`, "
-          "typically used as helper functions called from table queries above.")
+          "typically used as helper functions called from table queries above. "
+          "Query parameters are intentionally excluded from this documentation.")
         p()
         for expr in shared:
             name = expr.get("name", "")
@@ -1064,13 +1161,22 @@ def render_copilot_kb(
                 dtype = col.get("dataType", col.get("type", "unknown"))
                 desc = col.get("description", "")
                 hidden = col.get("isHidden", False)
+                is_calc = col.get("isCalculated", False)
+                expr = col.get("expression", "")
 
                 line = f'  Column "{col_name}" (data type: {dtype})'
+                if is_calc:
+                    line += " [calculated column]"
                 if hidden:
                     line += " [hidden from report view]"
                 if desc:
                     line += f": {desc}"
                 w(line)
+
+                if is_calc and expr:
+                    w("    This is a calculated column, defined by the following DAX formula:")
+                    for dax_line in sanitize(expr).splitlines():
+                        w(f"      {dax_line}")
         else:
             w("This table has no regular columns (may be a calculated or virtual table).")
 
@@ -1283,7 +1389,7 @@ def render_copilot_kb(
     shared = parser.shared_expressions()
     if shared:
         w("=" * 80)
-        w("SECTION 7: SHARED POWER QUERY FUNCTIONS AND PARAMETERS")
+        w("SECTION 7: SHARED POWER QUERY FUNCTIONS")
         w("=" * 80)
         w()
         for expr in shared:

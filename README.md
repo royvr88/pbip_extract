@@ -46,12 +46,12 @@ python pbip_extract.py <path-to-pbip-folder> --copilot --output knowledge.txt
 ## What gets extracted
 
 **Semantic model**
-- All tables with columns (name, data type, description)
+- All tables with columns (name, data type, description) — including full DAX formulas for calculated columns
 - All DAX measures with full expressions
 - Relationships (cardinality, cross-filter direction)
 - Row-Level Security (RLS) roles and filter expressions
 - Power Query (M) partition expressions per table
-- Shared Power Query functions and parameters (`expressions.tmdl`)
+- Shared Power Query functions (`expressions.tmdl`) — query **parameters are deliberately excluded**, since they often carry organisation-specific default values (server names, environments, connection info)
 
 **Report**
 - Report pages and visual types
