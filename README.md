@@ -41,7 +41,27 @@ python pbip_extract.py <path-to-pbip-folder> --copilot
 
 # LLM knowledge base to a specific file
 python pbip_extract.py <path-to-pbip-folder> --copilot --output knowledge.txt
+
+# Include per-table row counts (see "Row counts" below)
+python pbip_extract.py <path-to-pbip-folder> --rowcounts rowcounts.txt
 ```
+
+## Row counts
+
+The `.pbip` project files only describe the data **model** (tables, columns, M/DAX) —
+the actual loaded data lives in the Analysis Services engine behind an open Power BI
+Desktop file, not in anything checked into git. So getting a real row count per table
+needs a small manual round-trip instead of a live connection (which would require an
+extra ADOMD.NET/XMLA dependency and a running model):
+
+1. Run `pbip_extract.py` as usual. Alongside the documentation it writes a
+   `<project>_rowcount_query.dax` helper file (unless `--no-rowcount-query` is passed).
+2. Open the `.pbip` project in Power BI Desktop (model must be loaded) and go to
+   **View > DAX query view** — or use DAX Studio. Paste in the generated query and run it.
+3. Select all results (Ctrl+A), copy (Ctrl+C), and paste them into a plain text file
+   (keep the header row).
+4. Re-run `pbip_extract.py --rowcounts <that file>` — row counts now show up per table
+   and in the overview.
 
 ## What gets extracted
 
