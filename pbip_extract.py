@@ -53,21 +53,72 @@ _SHAREPOINT_URL_RE = re.compile(
 # Bestandsnamen die intern zijn maar niet gevoelig (bijv. swt_producten.xlsx) laten we staan.
 # Alleen de volledige URL wordt gemaskeerd.
 
+# Fabric SQL analytics endpoint hostnames, e.g. abc123xyz456.datawarehouse.fabric.microsoft.com
+# — masked regardless of context (named parameter, or a bare literal passed straight into
+# Sql.Database(...)), since the hostname itself already identifies the tenant/workspace.
+_FABRIC_SQL_ENDPOINT_RE = re.compile(
+    r'\b[a-z0-9]{6,}\.datawarehouse\.fabric\.microsoft\.com\b',
+    re.IGNORECASE,
+)
+
+# key = value / key: value / key = "value" assignments for well-known Fabric- and
+# SharePoint/OneDrive-connector identifiers that show up in M-query "let" steps, TMDL
+# parameter definitions, or navigation records (e.g. Source{[workspaceId="...", ...]}).
+# Extend this dict if other infra-identifying key names turn up.
+_INFRA_KEY_PLACEHOLDERS = {
+    "sqlendpoint": "FABRIC_SQL_ENDPOINT",
+    "sql endpoint": "FABRIC_SQL_ENDPOINT",
+    "workspaceid": "WORKSPACE_ID",
+    "lakehouseid": "LAKEHOUSE_ID",
+    "warehouseid": "WAREHOUSE_ID",
+    "datasetid": "DATASET_ID",
+    "groupid": "WORKSPACE_ID",
+    "driveid": "SHAREPOINT_DRIVE_ID",
+    "itemid": "SHAREPOINT_ITEM_ID",
+    "siteid": "SHAREPOINT_SITE_ID",
+}
+
+_INFRA_KV_RE = re.compile(
+    r'\b(' + "|".join(re.escape(k) for k in _INFRA_KEY_PLACEHOLDERS) + r')'
+    r'(\s*[:=]\s*)'
+    r'"?([^",\]\)\r\n]+?)"?'
+    r'(?=[,\]\)\r\n]|\s*$)',
+    re.IGNORECASE,
+)
+
+# "schema" is masked separately and more narrowly: it's a common, legitimate, benign
+# record field in classic SQL-connector navigation (Source{[Schema="dbo",Item="X"]}),
+# where masking it would remove useful, non-sensitive documentation. It's only masked
+# as a standalone parameter/let-step assignment that starts its own line
+# (e.g. "    schema = "brons_lh","), never as a field inside a "[...]" record literal —
+# those are always written inline (Schema="dbo",Item=...) rather than starting a line.
+_SCHEMA_ASSIGN_RE = re.compile(
+    r'(?im)^(\s*)schema(\s*[:=]\s*)"?([^",\]\)\r\n]+?)"?(?=[,\]\)\r\n]|\s*$)',
+)
+
+
 def sanitize(text: str) -> str:
     """
-    Maskeert SharePoint-URLs in Power Query / DAX expressions vóór output.
+    Maskeert organisatie-specifieke infrastructuurdetails in Power Query / DAX
+    expressies vóór output: SharePoint-URLs, Fabric SQL-endpoints, en bekende
+    Fabric/SharePoint object-ID's (workspaceId, lakehouseId, driveId, ...).
 
-    Wat er gebeurt:
+    De query-structuur zelf (functienamen, transformatiestappen, kolomverwijzingen)
+    blijft altijd intact — alleen de organisatie-specifieke waarden worden vervangen
+    door een placeholder, zodat het model te begrijpen blijft zonder te lekken op
+    welke tenant/workspace/resource het draait.
+
+    Wat er o.a. gebeurt:
       https://organisatie.sharepoint.com/sites/SITENAAM/Gedeelde%20documenten/map/bestand.xlsx
       → https://[TENANT].sharepoint.com/sites/[SITE]/Gedeelde documenten/map/bestand.xlsx
-
-    De tenant-naam en sitenaam worden vervangen; het pad daarna blijft leesbaar
-    zodat duidelijk is welke map/bestand de bron is.
+      abc123xyz456.datawarehouse.fabric.microsoft.com → [FABRIC_SQL_ENDPOINT]
+      workspaceId = "12345678-...."                   → workspaceId = [WORKSPACE_ID]
+      schema = "brons_lh"                              → schema = [SCHEMA]
     """
     if not text:
         return text
 
-    def _replace(m: re.Match) -> str:
+    def _replace_sharepoint(m: re.Match) -> str:
         url = m.group(0)
         try:
             parsed = urllib.parse.urlparse(url)
@@ -84,7 +135,19 @@ def sanitize(text: str) -> str:
             masked = "[SHAREPOINT-URL]"
         return masked
 
-    return _SHAREPOINT_URL_RE.sub(_replace, text)
+    def _replace_infra_kv(m: re.Match) -> str:
+        key, sep = m.group(1), m.group(2)
+        placeholder = _INFRA_KEY_PLACEHOLDERS[key.lower()]
+        return f"{key}{sep}[{placeholder}]"
+
+    def _replace_schema(m: re.Match) -> str:
+        return f"{m.group(1)}schema{m.group(2)}[SCHEMA]"
+
+    text = _SHAREPOINT_URL_RE.sub(_replace_sharepoint, text)
+    text = _FABRIC_SQL_ENDPOINT_RE.sub("[FABRIC_SQL_ENDPOINT]", text)
+    text = _INFRA_KV_RE.sub(_replace_infra_kv, text)
+    text = _SCHEMA_ASSIGN_RE.sub(_replace_schema, text)
+    return text
 
 
 # ---------------------------------------------------------------------------

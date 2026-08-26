@@ -63,6 +63,27 @@ extra ADOMD.NET/XMLA dependency and a running model):
 4. Re-run `pbip_extract.py --rowcounts <that file>` — row counts now show up per table
    and in the overview.
 
+## Sanitisation
+
+Power Query and DAX text is scanned for organisation-specific infrastructure values
+before it's written out, and those values are replaced with a placeholder — the query
+structure itself (functions, applied steps, column references) is always kept intact:
+
+| Found in the query | Replaced with |
+|---|---|
+| SharePoint site URL | `https://[TENANT].sharepoint.com/sites/[SITE]/...` (path/filename kept) |
+| Fabric SQL analytics endpoint hostname | `[FABRIC_SQL_ENDPOINT]` |
+| `workspaceId` / `groupId` value | `[WORKSPACE_ID]` |
+| `lakehouseId` value | `[LAKEHOUSE_ID]` |
+| `warehouseId` value | `[WAREHOUSE_ID]` |
+| `datasetId` value | `[DATASET_ID]` |
+| `driveId` / `itemId` / `siteId` value | `[SHAREPOINT_DRIVE_ID]` / `[SHAREPOINT_ITEM_ID]` / `[SHAREPOINT_SITE_ID]` |
+| standalone `schema = "..."` assignment | `[SCHEMA]` (the common `[Schema="dbo",Item=...]` navigation field used by classic SQL connectors is left alone — it's not sensitive) |
+
+Query **parameters** (`expressions.tmdl` entries with `IsParameterQuery=true`) are excluded
+from the documentation entirely rather than masked, since knowing a parameter merely
+exists is rarely useful on its own — see "Shared Power Query functions" below.
+
 ## What gets extracted
 
 **Semantic model**
