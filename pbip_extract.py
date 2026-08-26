@@ -53,21 +53,82 @@ _SHAREPOINT_URL_RE = re.compile(
 # Bestandsnamen die intern zijn maar niet gevoelig (bijv. swt_producten.xlsx) laten we staan.
 # Alleen de volledige URL wordt gemaskeerd.
 
+# Fabric SQL analytics endpoint hostnames, e.g. abc123xyz456.datawarehouse.fabric.microsoft.com
+# — masked regardless of context (named parameter, or a bare literal passed straight into
+# Sql.Database(...)), since the hostname itself already identifies the tenant/workspace.
+_FABRIC_SQL_ENDPOINT_RE = re.compile(
+    r'\b[a-z0-9]{6,}\.datawarehouse\.fabric\.microsoft\.com\b',
+    re.IGNORECASE,
+)
+
+# key = value / key: value / key = "value" assignments for well-known Fabric- and
+# SharePoint/OneDrive-connector identifiers that show up in M-query "let" steps, TMDL
+# parameter definitions, or navigation records (e.g. Source{[workspaceId="...", ...]}).
+# Extend this dict if other infra-identifying key names turn up.
+_INFRA_KEY_PLACEHOLDERS = {
+    "sqlendpoint": "FABRIC_SQL_ENDPOINT",
+    "sql endpoint": "FABRIC_SQL_ENDPOINT",
+    "workspaceid": "WORKSPACE_ID",
+    "lakehouseid": "LAKEHOUSE_ID",
+    "warehouseid": "WAREHOUSE_ID",
+    "datasetid": "DATASET_ID",
+    "groupid": "WORKSPACE_ID",
+    "driveid": "SHAREPOINT_DRIVE_ID",
+    "itemid": "SHAREPOINT_ITEM_ID",
+    "siteid": "SHAREPOINT_SITE_ID",
+}
+
+
+# The value itself is restricted to identifier-ish characters (letters, digits,
+# underscore, dot, hyphen — covers hostnames and GUIDs) with NO spaces or quotes
+# allowed. This matters: a greedy/lazy "anything but a few delimiters" value class
+# would, for a key name that also happens to be an ordinary business/column name
+# (e.g. WarehouseId inside a passthrough SQL string like
+# [Query="SELECT * FROM T WHERE WarehouseId = 5 AND Status = 'Open'"]), keep
+# consuming through spaces and text until the next delimiter — swallowing the rest
+# of the SQL and corrupting the output. Real infra values never contain spaces, so
+# stopping at the first non-identifier character is both safe and sufficient.
+_INFRA_KV_RE = re.compile(
+    r'\b(' + "|".join(re.escape(k) for k in _INFRA_KEY_PLACEHOLDERS) + r')'
+    r'(\s*[:=]\s*)'
+    r'"?([A-Za-z0-9_.\-]+)"?',
+    re.IGNORECASE,
+)
+
+# "schema" is masked separately and more narrowly: it's a common, legitimate, benign
+# record field in classic SQL-connector navigation (Source{[Schema="dbo",Item="X"]}),
+# where masking it would remove useful, non-sensitive documentation. It's only masked
+# as a standalone parameter/let-step assignment that starts its own line
+# (e.g. "    schema = "brons_lh","), never as a field inside a "[...]" record literal —
+# those are always written inline (Schema="dbo",Item=...) rather than starting a line.
+# Same identifier-only value class as _INFRA_KV_RE, for the same over-matching reason.
+_SCHEMA_ASSIGN_RE = re.compile(
+    r'(?im)^(\s*)schema(\s*[:=]\s*)"?([A-Za-z0-9_.\-]+)"?',
+)
+
+
 def sanitize(text: str) -> str:
     """
-    Maskeert SharePoint-URLs in Power Query / DAX expressions vóór output.
+    Maskeert organisatie-specifieke infrastructuurdetails in Power Query / DAX
+    expressies vóór output: SharePoint-URLs, Fabric SQL-endpoints, en bekende
+    Fabric/SharePoint object-ID's (workspaceId, lakehouseId, driveId, ...).
 
-    Wat er gebeurt:
+    De query-structuur zelf (functienamen, transformatiestappen, kolomverwijzingen)
+    blijft altijd intact — alleen de organisatie-specifieke waarden worden vervangen
+    door een placeholder, zodat het model te begrijpen blijft zonder te lekken op
+    welke tenant/workspace/resource het draait.
+
+    Wat er o.a. gebeurt:
       https://organisatie.sharepoint.com/sites/SITENAAM/Gedeelde%20documenten/map/bestand.xlsx
       → https://[TENANT].sharepoint.com/sites/[SITE]/Gedeelde documenten/map/bestand.xlsx
-
-    De tenant-naam en sitenaam worden vervangen; het pad daarna blijft leesbaar
-    zodat duidelijk is welke map/bestand de bron is.
+      abc123xyz456.datawarehouse.fabric.microsoft.com → [FABRIC_SQL_ENDPOINT]
+      workspaceId = "12345678-...."                   → workspaceId = [WORKSPACE_ID]
+      schema = "brons_lh"                              → schema = [SCHEMA]
     """
     if not text:
         return text
 
-    def _replace(m: re.Match) -> str:
+    def _replace_sharepoint(m: re.Match) -> str:
         url = m.group(0)
         try:
             parsed = urllib.parse.urlparse(url)
@@ -84,7 +145,19 @@ def sanitize(text: str) -> str:
             masked = "[SHAREPOINT-URL]"
         return masked
 
-    return _SHAREPOINT_URL_RE.sub(_replace, text)
+    def _replace_infra_kv(m: re.Match) -> str:
+        key, sep = m.group(1), m.group(2)
+        placeholder = _INFRA_KEY_PLACEHOLDERS[key.lower()]
+        return f"{key}{sep}[{placeholder}]"
+
+    def _replace_schema(m: re.Match) -> str:
+        return f"{m.group(1)}schema{m.group(2)}[SCHEMA]"
+
+    text = _SHAREPOINT_URL_RE.sub(_replace_sharepoint, text)
+    text = _FABRIC_SQL_ENDPOINT_RE.sub("[FABRIC_SQL_ENDPOINT]", text)
+    text = _INFRA_KV_RE.sub(_replace_infra_kv, text)
+    text = _SCHEMA_ASSIGN_RE.sub(_replace_schema, text)
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -111,13 +184,37 @@ class TMSLParser:
         return table.get("measures", [])
 
     def get_columns(self, table: dict) -> list[dict]:
-        return [c for c in table.get("columns", []) if c.get("type") != "rowNumber"]
+        result = []
+        for c in table.get("columns", []):
+            if c.get("type") == "rowNumber":
+                continue
+            col = dict(c)
+            raw_expr = c.get("expression", "")
+            expr = "\n".join(raw_expr) if isinstance(raw_expr, list) else str(raw_expr or "")
+            col["expression"] = expr.strip()
+            col["isCalculated"] = c.get("type") == "calculated" or bool(col["expression"])
+            result.append(col)
+        return result
 
     def get_partitions(self, table: dict) -> list[dict]:
         return table.get("partitions", [])
 
     def shared_expressions(self) -> list[dict]:
-        return []
+        """Shared M functions from the model's top-level `expressions` array — parameters
+        are excluded on purpose, since they often carry organisation-specific default
+        values (servers, environments)."""
+        result = []
+        for expr in self._model().get("expressions", []):
+            raw = expr.get("expression", "")
+            text = "\n".join(raw) if isinstance(raw, list) else str(raw)
+            if re.search(r"IsParameterQuery\s*=\s*true", text, re.IGNORECASE):
+                continue
+            result.append({
+                "name": expr.get("name", ""),
+                "kind": expr.get("kind", ""),
+                "expression": text.strip(),
+            })
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -175,7 +272,10 @@ class TMLDParser:
 
         header = lines[i].strip()
         if header.startswith("table "):
-            table["name"] = header[6:].strip()
+            # TMDL quotes names that contain spaces/special characters, e.g.
+            # table 'Beoordelingen - laatste 4 jaar' — strip that quoting so
+            # the logical name doesn't end up with literal quote characters in it.
+            table["name"] = header[6:].strip().strip("'")
         else:
             table["name"] = path.stem
         i += 1
@@ -207,12 +307,14 @@ class TMLDParser:
             elif stripped.startswith("column ") and line.startswith("\t") and not line.startswith("\t\t"):
                 flush_block()
                 current_type = "column"
-                current_name = stripped[7:].strip().strip("'")
+                # A calculated column's header is "column Name = <DAX expression>" —
+                # split off the "= ..." part so the name doesn't include the formula.
+                current_name = stripped[7:].split("=")[0].strip().strip("'")
                 current_block = [line]
             elif stripped.startswith("partition ") and line.startswith("\t") and not line.startswith("\t\t"):
                 flush_block()
                 current_type = "partition"
-                current_name = stripped[10:].strip().strip("'")
+                current_name = stripped[10:].split("=")[0].strip().strip("'")
                 current_block = [line]
             elif stripped.startswith("isHidden:") and line.startswith("\t") and not line.startswith("\t\t"):
                 table["isHidden"] = "true" in stripped.lower()
@@ -232,6 +334,9 @@ class TMLDParser:
             "formatString:", "lineageTag:", "description:", "displayFolder:",
             "annotation ", "isHidden:", "kpiStatusType:", "dataCategory:",
         )
+        # TMDL's bare-boolean shorthand: a lone property name on its own line means
+        # "= true" (isHidden ⇔ isHidden: true) — also a sibling-property boundary.
+        SIBLING_PROPS_BARE = {"isHidden"}
 
         in_dax = False
 
@@ -246,7 +351,7 @@ class TMLDParser:
                 in_dax = True
                 continue
 
-            if stripped and any(stripped.startswith(p) for p in SIBLING_PROPS):
+            if stripped and (any(stripped.startswith(p) for p in SIBLING_PROPS) or stripped in SIBLING_PROPS_BARE):
                 in_dax = False
                 if stripped.startswith("formatString:"):
                     format_string = stripped.split(":", 1)[1].strip().strip("'\"")
@@ -271,20 +376,78 @@ class TMLDParser:
         }
 
     def _parse_column_block(self, name: str, block: list[str]) -> Optional[dict]:
-        col: dict = {"name": name, "dataType": "unknown", "isHidden": False, "description": ""}
+        col: dict = {
+            "name": name, "dataType": "unknown", "isHidden": False,
+            "description": "", "expression": "", "isCalculated": False,
+        }
+
+        # Sibling properties that can follow a column header — anything else while
+        # in_dax is still open is treated as (part of) a calculated column's DAX formula.
+        SIBLING_PROPS = (
+            "dataType:", "lineageTag:", "description:", "displayFolder:",
+            "annotation ", "isHidden:", "formatString:", "summarizeBy:",
+            "sourceColumn:", "isDataTypeInferred:", "sortByColumn:",
+            "dataCategory:", "isNameInferred:", "isKey:", "isUnique:",
+            "isAvailableInMdx:", "keepUniqueRows:", "isNullable:",
+            "encoding:", "state:", "changedProperty:", "sourceProviderType:",
+            "alignment:", "formatStringDefinition:",
+        )
+        # TMDL's bare-boolean shorthand: a lone property name on its own line means
+        # "= true" (isHidden ⇔ isHidden: true) — also a sibling-property boundary.
+        SIBLING_PROPS_BARE = {
+            "isHidden", "isKey", "isUnique", "isDataTypeInferred", "isNameInferred",
+            "isAvailableInMdx", "keepUniqueRows", "isNullable",
+        }
+
+        dax_lines: list[str] = []
+        in_dax = False
+
         for line in block:
-            if "dataType:" in line:
-                col["dataType"] = line.split(":", 1)[1].strip()
-            elif "isHidden:" in line:
-                col["isHidden"] = "true" in line.lower()
-            elif "description:" in line:
-                col["description"] = line.split(":", 1)[1].strip().strip("'\"")
+            stripped = line.strip()
+
+            if stripped.startswith("column ") and "=" in stripped:
+                inline = stripped.split("=", 1)[1].strip()
+                if inline:
+                    dax_lines.append(inline)
+                in_dax = True
+                continue
+
+            if stripped and (any(stripped.startswith(p) for p in SIBLING_PROPS) or stripped in SIBLING_PROPS_BARE):
+                in_dax = False
+                if stripped.startswith("dataType:"):
+                    col["dataType"] = stripped.split(":", 1)[1].strip()
+                elif stripped.startswith("isHidden:"):
+                    col["isHidden"] = "true" in stripped.lower()
+                elif stripped == "isHidden":
+                    col["isHidden"] = True
+                elif stripped.startswith("description:"):
+                    col["description"] = stripped.split(":", 1)[1].strip().strip("'\"")
+                continue
+
+            if in_dax:
+                clean = stripped.strip("`").strip()
+                dax_lines.append(clean if clean else "")
+
+        while dax_lines and not dax_lines[0]:
+            dax_lines.pop(0)
+        while dax_lines and not dax_lines[-1]:
+            dax_lines.pop()
+
+        if dax_lines:
+            col["expression"] = "\n".join(dax_lines).strip()
+            col["isCalculated"] = True
+
         return col
 
     def _parse_partition_block(self, name: str, block: list[str]) -> dict:
         partition: dict = {"name": name, "mode": "import", "source": {}}
         m_lines: list[str] = []
         in_source = False
+        # None = no fence seen yet (or none used); True = opening ``` has been seen
+        # and we're waiting for the matching closing ```. TMDL allows the opening
+        # fence either attached to "source =" on the same line, or on its own line
+        # right after — both must be recognised as *opening*, not closing.
+        fenced = False
 
         for line in block:
             stripped = line.strip()
@@ -292,19 +455,38 @@ class TMLDParser:
                 partition["mode"] = stripped.split(":", 1)[1].strip()
             elif stripped == "source =" or stripped.startswith("source ="):
                 in_source = True
-                rest = stripped[len("source ="):].strip().strip("`")
+                fenced = False
+                rest = stripped[len("source ="):].strip()
+                if rest == "```":
+                    # opening fence attached to the "source =" line itself
+                    fenced = True
+                    rest = ""
+                else:
+                    rest = rest.strip("`")
                 if rest:
                     m_lines.append(rest)
             elif in_source:
-                sibling_keywords = {"mode:", "annotation", "description:", "sourceColumn:", "isHidden:"}
-                if any(stripped.startswith(k) for k in sibling_keywords):
-                    in_source = False
+                if stripped == "```":
+                    if fenced:
+                        in_source = False  # closing fence
+                    else:
+                        fenced = True  # opening fence on its own line
                     continue
-                clean = stripped.strip("`")
-                if clean:
-                    m_lines.append(clean)
+                if not fenced:
+                    sibling_keywords = {"mode:", "annotation", "description:", "sourceColumn:", "isHidden:"}
+                    if any(stripped.startswith(k) for k in sibling_keywords):
+                        in_source = False
+                        continue
+                # Keep blank lines so multi-step M queries keep their original
+                # spacing instead of being collapsed onto consecutive lines.
+                m_lines.append(stripped)
 
         if m_lines:
+            # Trim leading/trailing blank lines only, keep interior spacing intact.
+            while m_lines and not m_lines[0]:
+                m_lines.pop(0)
+            while m_lines and not m_lines[-1]:
+                m_lines.pop()
             partition["source"] = {"expression": "\n".join(m_lines).strip()}
 
         return partition
@@ -317,16 +499,25 @@ class TMLDParser:
         m_lines: list[str] = []
         in_expr = False
 
+        def flush():
+            if current_name and m_lines:
+                while m_lines and not m_lines[0]:
+                    m_lines.pop(0)
+                while m_lines and not m_lines[-1]:
+                    m_lines.pop()
+                expr_text = "\n".join(m_lines).strip()
+                expressions.append({
+                    "name": current_name,
+                    "kind": current_kind,
+                    "expression": expr_text,
+                    "is_parameter": bool(re.search(r"IsParameterQuery\s*=\s*true", expr_text, re.IGNORECASE)),
+                })
+
         for line in lines:
             stripped = line.strip()
 
             if stripped.startswith("expression "):
-                if current_name and m_lines:
-                    expressions.append({
-                        "name": current_name,
-                        "kind": current_kind,
-                        "expression": "\n".join(m_lines).strip(),
-                    })
+                flush()
                 name_part = stripped[len("expression "):].split("=")[0].strip().strip("'\"")
                 current_name = name_part
                 current_kind = "expression"
@@ -338,22 +529,19 @@ class TMLDParser:
                         m_lines.append(rest)
             elif stripped.startswith("kind:"):
                 current_kind = stripped.split(":", 1)[1].strip()
-            elif in_expr and stripped and not stripped.startswith("kind:") and not stripped.startswith("lineageTag:") and not stripped.startswith("annotation"):
+            elif in_expr and not stripped.startswith("kind:") and not stripped.startswith("lineageTag:") and not stripped.startswith("annotation"):
                 m_lines.append(line.rstrip().strip("`"))
             elif stripped.startswith("lineageTag:") or stripped.startswith("annotation"):
                 in_expr = False
 
-        if current_name and m_lines:
-            expressions.append({
-                "name": current_name,
-                "kind": current_kind,
-                "expression": "\n".join(m_lines).strip(),
-            })
+        flush()
 
         return expressions
 
     def shared_expressions(self) -> list[dict]:
-        return getattr(self, "_shared_expressions", [])
+        """Shared M functions from expressions.tmdl — parameters are excluded on purpose,
+        since they often carry organisation-specific default values (servers, environments)."""
+        return [e for e in getattr(self, "_shared_expressions", []) if not e.get("is_parameter")]
 
     def _parse_relationships(self, path: Path) -> list[dict]:
         lines = self._lines(path)
@@ -434,7 +622,7 @@ class TMLDParser:
         return table.get("measures", [])
 
     def get_columns(self, table: dict) -> list[dict]:
-        return [c for c in table.get("columns", []) if not c.get("isHidden", False) or True]
+        return table.get("columns", [])
 
     def get_partitions(self, table: dict) -> list[dict]:
         return table.get("partitions", [])
@@ -654,7 +842,9 @@ def render_markdown(
     parser,
     report_data: Optional[dict],
     model_format: str,
+    row_counts: Optional[dict[str, int]] = None,
 ) -> str:
+    row_counts = row_counts or {}
     lines: list[str] = []
 
     def h1(t): lines.extend([f"# {t}", ""])
@@ -667,18 +857,25 @@ def render_markdown(
     p()
 
     h2("Table of Contents")
-    p("1. [Data Model Overview](#data-model-overview)")
-    p("2. [Tables & Columns](#tables--columns)")
-    p("3. [Measure Catalogue](#measure-catalogue)")
-    p("4. [Relationships](#relationships)")
+    toc_entries = [
+        "[Data Model Overview](#data-model-overview)",
+        "[Tables & Columns](#tables--columns)",
+        "[Measure Catalogue](#measure-catalogue)",
+        "[Relationships](#relationships)",
+    ]
     if parser.roles():
-        p("5. [Row-Level Security](#row-level-security)")
+        toc_entries.append("[Row-Level Security](#row-level-security)")
     if report_data:
-        p("6. [Report Structure](#report-structure)")
+        toc_entries.append("[Report Structure](#report-structure)")
+    toc_entries.append("[Data Lineage & Impact Analysis](#data-lineage--impact-analysis)")
+    for i, entry in enumerate(toc_entries, 1):
+        p(f"{i}. {entry}")
     p()
 
     h2("Data Model Overview")
     tables = parser.tables()
+    all_table_names = [t.get("name", "") for t in tables]
+    all_measure_names = [m.get("name", "") for t in tables for m in parser.get_measures(t)]
     total_measures = sum(len(parser.get_measures(t)) for t in tables)
     total_columns = sum(len(parser.get_columns(t)) for t in tables)
     total_rels = len(parser.relationships())
@@ -690,7 +887,22 @@ def render_markdown(
     p(f"| Measures | {total_measures} |")
     p(f"| Relationships | {total_rels} |")
     p(f"| RLS Roles | {len(parser.roles())} |")
+    if row_counts:
+        known_total = sum(row_counts.get(t.get("name", ""), 0) for t in tables if t.get("name", "") in row_counts)
+        p(f"| Total rows (known tables) | {known_total:,} |")
     p()
+
+    if row_counts:
+        p("**Table sizes** _(pasted from a manually run DAX row-count query — see "
+          "`--rowcounts`; not necessarily current)_:")
+        p()
+        p("| Table | Rows |")
+        p("|-------|------|")
+        for table in tables:
+            name = table.get("name", "")
+            count = row_counts.get(name)
+            p(f"| {name} | {count:,} |" if count is not None else f"| {name} | _unknown_ |")
+        p()
 
     h2("Tables & Columns")
     for table in tables:
@@ -701,30 +913,42 @@ def render_markdown(
         measures = parser.get_measures(table)
         partitions = parser.get_partitions(table)
 
+        if table_name in row_counts:
+            p(f"**Rows:** {row_counts[table_name]:,}")
+            p()
+
         if partitions:
-            source_info = ""
             for pt in partitions:
                 source = pt.get("source", {})
-                if isinstance(source, dict):
-                    query = source.get("query", source.get("expression", ""))
-                    if query:
-                        # ↓ sanitize vóór output
-                        query_clean = sanitize(query)
-                        source_info = f"`{query_clean[:120]}{'...' if len(query_clean) > 120 else ''}`"
-            if source_info:
-                p(f"**Source:** {source_info}")
-                p()
+                if isinstance(source, dict) and source.get("query", source.get("expression", "")):
+                    mode = pt.get("mode", "import")
+                    p(f"**Source:** Power Query (`{mode}`) — full expression under "
+                      f"[Power Query (M) Sources](#power-query-m-sources).")
+                    p()
+                    break
 
         if columns:
-            p("| Column | Data Type | Hidden | Description |")
-            p("|--------|-----------|--------|-------------|")
+            p("| Column | Data Type | Calculated | Hidden | Description |")
+            p("|--------|-----------|------------|--------|-------------|")
             for col in columns:
                 name = col.get("name", "")
                 dtype = col.get("dataType", col.get("type", "unknown"))
+                calc = "✓" if col.get("isCalculated") else ""
                 hidden = "✓" if col.get("isHidden") else ""
                 desc = col.get("description", "")
-                p(f"| {name} | {dtype} | {hidden} | {desc} |")
+                p(f"| {name} | {dtype} | {calc} | {hidden} | {desc} |")
             p()
+
+            calc_columns = [c for c in columns if c.get("isCalculated") and c.get("expression")]
+            if calc_columns:
+                p("**Calculated column formulas:**")
+                p()
+                for col in calc_columns:
+                    p(f"#### `{col.get('name', '')}` (calculated column)")
+                    p("```dax")
+                    p(sanitize(col["expression"]))
+                    p("```")
+                    p()
         else:
             p("_No columns defined (may be a calculated or virtual table)._")
             p()
@@ -876,9 +1100,10 @@ def render_markdown(
 
     shared = parser.shared_expressions()
     if shared:
-        h2("Shared Power Query Functions & Parameters")
+        h2("Shared Power Query Functions")
         p("These are reusable queries/functions defined in `expressions.tmdl`, "
-          "typically used as helper functions called from table queries above.")
+          "typically used as helper functions called from table queries above. "
+          "Query parameters are intentionally excluded from this documentation.")
         p()
         for expr in shared:
             name = expr.get("name", "")
@@ -894,6 +1119,62 @@ def render_markdown(
                 p(sanitize(body))
                 p("```")
             p()
+
+    h2("Data Lineage & Impact Analysis")
+    p("For each table: where its data comes from (upstream), and what depends on it "
+      "within the model and report (downstream) — useful for assessing the impact of "
+      "a change before making it.")
+    p()
+
+    lineage = build_lineage_index(parser, tables, all_table_names, all_measure_names, report_data)
+    for table in tables:
+        name = table.get("name", "Unknown")
+        info = lineage.get(name, {})
+        h3(name)
+
+        source = info.get("source")
+        if source:
+            detail = f"**Upstream (source):** {source['connector']}"
+            bits = []
+            if source.get("schema"):
+                bits.append(f"schema: `{source['schema']}`")
+            if source.get("object"):
+                bits.append(f"object: `{source['object']}`")
+            if bits:
+                detail += " — " + ", ".join(bits)
+            p(detail)
+        else:
+            p("**Upstream (source):** no Power Query source found for this table "
+              "(may be a calculated table, or DirectQuery/live connection).")
+        p()
+
+        ref_columns = info.get("ref_columns", [])
+        ref_measures = info.get("ref_measures", [])
+        related = info.get("related", [])
+        used_in_visuals = info.get("used_in_visuals", [])
+
+        if ref_columns or ref_measures or related:
+            p("**Downstream — referenced by (within the model):**")
+            if ref_columns:
+                p(f"- Calculated columns ({len(ref_columns)}): "
+                  + ", ".join(f"`{t}[{c}]`" for t, c in ref_columns))
+            if ref_measures:
+                p(f"- Measures ({len(ref_measures)}): "
+                  + ", ".join(f"`{m}`" for _, m in ref_measures))
+            if related:
+                p(f"- Relationships ({len(related)}): " + "; ".join(f"`{r}`" for r in related))
+        else:
+            p("**Downstream — referenced by (within the model):** none found — no other "
+              "calculated column, measure, or relationship references this table.")
+        p()
+
+        if used_in_visuals:
+            p(f"**Downstream — used in report ({len(used_in_visuals)} visual(s)):**")
+            for usage in used_in_visuals:
+                p(f"- {usage}")
+        else:
+            p("**Downstream — used in report:** not used in any visual field binding found in the report.")
+        p()
 
     p("---")
     p("_Generated by pbip_document.py_")
@@ -975,6 +1256,142 @@ def describe_dax(dax: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Data lineage / impact analysis
+#
+# Builds, per table, an upstream view (which physical source it's loaded from)
+# and a downstream view (which calculated columns, measures, relationships and
+# report visuals depend on it) — so a reader can answer "what would break if I
+# changed this table?" without cross-referencing every other section by hand.
+# ---------------------------------------------------------------------------
+
+# M function names that identify a connector, checked in priority order — most
+# specific first, since e.g. a Fabric Warehouse connection still calls Sql.Database().
+_CONNECTOR_PATTERNS = [
+    (re.compile(r"\.datawarehouse\.fabric\.microsoft\.com", re.IGNORECASE), "Fabric SQL Endpoint (Warehouse / Lakehouse SQL analytics endpoint)"),
+    (re.compile(r"\bLakehouse\.Contents\s*\(", re.IGNORECASE), "Fabric Lakehouse (OneLake)"),
+    (re.compile(r"\bDataflow\b|\bPowerPlatform\.Dataflows\s*\(", re.IGNORECASE), "Power BI / Fabric Dataflow"),
+    (re.compile(r"sharepoint\.com|\bSharePoint\.(Files|Contents)\s*\(", re.IGNORECASE), "SharePoint"),
+    (re.compile(r"\bOneDrive\.", re.IGNORECASE), "OneDrive"),
+    (re.compile(r"\bSql\.Database\s*\(", re.IGNORECASE), "SQL Server / Azure SQL"),
+    (re.compile(r"\bPostgreSQL\.Database\s*\(", re.IGNORECASE), "PostgreSQL"),
+    (re.compile(r"\bMySQL\.Database\s*\(", re.IGNORECASE), "MySQL"),
+    (re.compile(r"\bOdbc\.(Query|DataSource)\s*\(", re.IGNORECASE), "ODBC source"),
+    (re.compile(r"\bOData\.Feed\s*\(", re.IGNORECASE), "OData feed"),
+    (re.compile(r"\bWeb\.Contents\s*\(", re.IGNORECASE), "Web API"),
+    (re.compile(r"\bExcel\.Workbook\s*\(", re.IGNORECASE), "Excel workbook"),
+    (re.compile(r"\bCsv\.Document\s*\(", re.IGNORECASE), "CSV file"),
+    (re.compile(r"\bJson\.Document\s*\(", re.IGNORECASE), "JSON source"),
+    (re.compile(r"\bFolder\.(Files|Contents)\s*\(", re.IGNORECASE), "Folder"),
+]
+
+_SCHEMA_ITEM_RE = re.compile(
+    r'\[\s*(?:Schema\s*=\s*(?:"(?P<schema_lit>[^"]*)"|(?P<schema_var>[A-Za-z_][A-Za-z0-9_]*))\s*,\s*)?'
+    r'Item\s*=\s*(?:"(?P<item_lit>[^"]*)"|(?P<item_var>[A-Za-z_][A-Za-z0-9_]*))',
+    re.IGNORECASE,
+)
+
+
+def parse_source_chain(m_expression: str) -> Optional[dict]:
+    """Classifies a table's M-query source without leaking any org-specific literal
+    value — only the connector *type* and the non-sensitive schema/object navigation
+    (already established as safe to show; see sanitize()) are returned."""
+    if not m_expression or not m_expression.strip():
+        return None
+
+    connector = next(
+        (label for pattern, label in _CONNECTOR_PATTERNS if pattern.search(m_expression)),
+        "Other / custom M source",
+    )
+
+    schema = table_obj = None
+    m = _SCHEMA_ITEM_RE.search(m_expression)
+    if m:
+        schema = m.group("schema_lit") or (
+            f"(from step/parameter: {m.group('schema_var')})" if m.group("schema_var") else None
+        )
+        table_obj = m.group("item_lit") or (
+            f"(from step/parameter: {m.group('item_var')})" if m.group("item_var") else None
+        )
+
+    return {"connector": connector, "schema": schema, "object": table_obj}
+
+
+def build_lineage_index(
+    parser,
+    tables: list[dict],
+    all_table_names: list[str],
+    all_measure_names: list[str],
+    report_data: Optional[dict],
+) -> dict[str, dict]:
+    # Every calculated column's and measure's own DAX dependencies, computed once.
+    col_deps = []   # (owner_table, column_name, refs)
+    measure_deps = []  # (owner_table, measure_name, refs)
+
+    for t in tables:
+        owner = t.get("name", "")
+        for col in parser.get_columns(t):
+            expr = col.get("expression", "") if col.get("isCalculated") else ""
+            if expr:
+                col_deps.append((owner, col.get("name", ""), extract_dax_refs(expr, all_table_names, all_measure_names)))
+        for measure in parser.get_measures(t):
+            expr = measure.get("expression", "").strip()
+            if expr:
+                measure_deps.append((owner, measure.get("name", ""), extract_dax_refs(expr, all_table_names, all_measure_names)))
+
+    # Which report visuals surface a field from each table.
+    table_visual_usage: dict[str, list[str]] = {}
+    if report_data:
+        for page in report_data.get("pages", []):
+            page_name = page.get("name", "Unknown")
+            for visual in page.get("visuals", []):
+                vtype = visual.get("visualType", "unknown")
+                title = visual.get("title", "")
+                label = f'"{title}" ({vtype}) on page "{page_name}"' if title else f'{vtype} on page "{page_name}"'
+                seen = set()
+                for f in visual.get("fields", []):
+                    fm = re.search(r"([A-Za-z0-9_ ]+)\[", f.get("field", ""))
+                    if fm:
+                        entity = fm.group(1).strip()
+                        if entity and entity not in seen:
+                            seen.add(entity)
+                            table_visual_usage.setdefault(entity, []).append(label)
+
+    lineage: dict[str, dict] = {}
+    for t in tables:
+        name = t.get("name", "")
+
+        source = None
+        for pt in parser.get_partitions(t):
+            src = pt.get("source", {})
+            expr = src.get("expression", "") if isinstance(src, dict) else ""
+            if expr:
+                source = parse_source_chain(expr)
+                break
+
+        related = []
+        for rel in parser.relationships():
+            from_t = rel.get("fromTable", rel.get("fromTableId", ""))
+            to_t = rel.get("toTable", rel.get("toTableId", ""))
+            from_c = rel.get("fromColumn", rel.get("fromColumnId", ""))
+            to_c = rel.get("toColumn", rel.get("toColumnId", ""))
+            if from_t == name or to_t == name:
+                related.append(f"{from_t}[{from_c}] → {to_t}[{to_c}]")
+
+        # Deliberately includes same-table dependents too (e.g. a measure defined on
+        # this table that sums one of its own columns) — those break just as much if
+        # this table's columns change, so they belong in the impact analysis.
+        lineage[name] = {
+            "source": source,
+            "related": related,
+            "ref_columns": [(owner, cname) for owner, cname, refs in col_deps if name in refs["tables"]],
+            "ref_measures": [(owner, mname) for owner, mname, refs in measure_deps if name in refs["tables"]],
+            "used_in_visuals": table_visual_usage.get(name, []),
+        }
+
+    return lineage
+
+
+# ---------------------------------------------------------------------------
 # Copilot knowledge base renderer
 # ---------------------------------------------------------------------------
 
@@ -983,7 +1400,9 @@ def render_copilot_kb(
     parser,
     report_data: Optional[dict],
     model_format: str,
+    row_counts: Optional[dict[str, int]] = None,
 ) -> str:
+    row_counts = row_counts or {}
     tables = parser.tables()
     all_table_names = [t.get("name", "") for t in tables]
     all_measure_names = [
@@ -1009,6 +1428,8 @@ def render_copilot_kb(
     w("- How tables are related to each other")
     w("- Which measures depend on other measures or columns")
     w("- Which pages and visuals exist in the report, and which fields each visual uses")
+    w("- Where a table's data comes from, and what would be impacted if it changed "
+      "(see Section 8: Data Lineage and Impact Analysis)")
     w()
     w("When answering questions about a measure, always explain:")
     w("1. What the measure calculates in plain language")
@@ -1030,6 +1451,13 @@ def render_copilot_kb(
         pages = report_data.get("pages", [])
         total_visuals = sum(len(p.get("visuals", [])) for p in pages)
         w(f"Report pages: {len(pages)} ({total_visuals} visuals total)")
+    if row_counts:
+        w()
+        w("Table row counts (manually pasted from a DAX row-count query, may be stale):")
+        for t in tables:
+            name = t.get("name", "")
+            if name in row_counts:
+                w(f"  {name}: {row_counts[name]:,} rows")
     w()
 
     w("=" * 80)
@@ -1045,6 +1473,9 @@ def render_copilot_kb(
 
         w(f"TABLE: {table_name}")
         w("-" * 60)
+
+        if table_name in row_counts:
+            w(f"Row count: {row_counts[table_name]:,} (manually pasted from a DAX query, may be stale)")
 
         for pt in partitions:
             source = pt.get("source", {})
@@ -1064,13 +1495,22 @@ def render_copilot_kb(
                 dtype = col.get("dataType", col.get("type", "unknown"))
                 desc = col.get("description", "")
                 hidden = col.get("isHidden", False)
+                is_calc = col.get("isCalculated", False)
+                expr = col.get("expression", "")
 
                 line = f'  Column "{col_name}" (data type: {dtype})'
+                if is_calc:
+                    line += " [calculated column]"
                 if hidden:
                     line += " [hidden from report view]"
                 if desc:
                     line += f": {desc}"
                 w(line)
+
+                if is_calc and expr:
+                    w("    This is a calculated column, defined by the following DAX formula:")
+                    for dax_line in sanitize(expr).splitlines():
+                        w(f"      {dax_line}")
         else:
             w("This table has no regular columns (may be a calculated or virtual table).")
 
@@ -1283,7 +1723,7 @@ def render_copilot_kb(
     shared = parser.shared_expressions()
     if shared:
         w("=" * 80)
-        w("SECTION 7: SHARED POWER QUERY FUNCTIONS AND PARAMETERS")
+        w("SECTION 7: SHARED POWER QUERY FUNCTIONS")
         w("=" * 80)
         w()
         for expr in shared:
@@ -1298,10 +1738,153 @@ def render_copilot_kb(
             w()
 
     w("=" * 80)
+    w("SECTION 8: DATA LINEAGE AND IMPACT ANALYSIS")
+    w("=" * 80)
+    w()
+    w("For each table: where its data comes from (upstream), and what depends on it")
+    w("within the model and report (downstream). Use this to answer questions like")
+    w('"what would break if I changed table X?" or "where does table Y\'s data come from?".')
+    w()
+
+    lineage = build_lineage_index(parser, tables, all_table_names, all_measure_names, report_data)
+    for table in tables:
+        name = table.get("name", "Unknown")
+        info = lineage.get(name, {})
+
+        w(f"TABLE: {name}")
+        w("-" * 60)
+
+        source = info.get("source")
+        if source:
+            detail = f"Upstream source: {source['connector']}"
+            bits = []
+            if source.get("schema"):
+                bits.append(f"schema: {source['schema']}")
+            if source.get("object"):
+                bits.append(f"object: {source['object']}")
+            if bits:
+                detail += " (" + ", ".join(bits) + ")"
+            w(detail)
+        else:
+            w("Upstream source: no Power Query source found (calculated table, or "
+              "DirectQuery/live connection).")
+
+        ref_columns = info.get("ref_columns", [])
+        ref_measures = info.get("ref_measures", [])
+        related = info.get("related", [])
+        used_in_visuals = info.get("used_in_visuals", [])
+
+        if ref_columns or ref_measures or related:
+            w("Downstream — referenced by:")
+            if ref_columns:
+                w(f"  Calculated columns ({len(ref_columns)}): "
+                  + ", ".join(f"{t}[{c}]" for t, c in ref_columns))
+            if ref_measures:
+                w(f"  Measures ({len(ref_measures)}): " + ", ".join(m for _, m in ref_measures))
+            if related:
+                w(f"  Relationships ({len(related)}): " + "; ".join(related))
+        else:
+            w("Downstream — referenced by: no other calculated column, measure, or "
+              "relationship references this table.")
+
+        if used_in_visuals:
+            w(f"Downstream — used in report ({len(used_in_visuals)} visual(s)):")
+            for usage in used_in_visuals:
+                w(f"  - {usage}")
+        else:
+            w("Downstream — used in report: not used in any visual field binding found in the report.")
+
+        w()
+
+    w("=" * 80)
     w("END OF KNOWLEDGE BASE")
     w("=" * 80)
 
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Row-count helper — no data lives in the .pbip files themselves, so getting a
+# real row count per table means running a DAX query against the loaded model.
+# Rather than requiring a live XMLA/ADOMD.NET connection (extra dependency,
+# only works while the model is open), this generates a query you paste into
+# Power BI Desktop's DAX query view or DAX Studio by hand; the pasted-back
+# result is then merged into the documentation via --rowcounts.
+# ---------------------------------------------------------------------------
+
+def generate_rowcount_query(tables: list[dict]) -> str:
+    lines = [
+        "// Row-count helper query — generated by pbip_extract.py",
+        "//",
+        "// How to use:",
+        "//   1. Open this .pbip project in Power BI Desktop (the model must be loaded),",
+        "//      or connect to it with DAX Studio.",
+        "//   2. Power BI Desktop: View > DAX query view, paste the query below, run it.",
+        "//      DAX Studio: paste the query below, run it (F5).",
+        "//   3. Select all results (Ctrl+A), copy (Ctrl+C), and paste them into a new",
+        "//      text file (headers included).",
+        "//   4. Re-run pbip_extract.py with --rowcounts <that file> to include the",
+        "//      counts in the generated documentation.",
+        "",
+    ]
+
+    names = [t.get("name", "") for t in tables if t.get("name")]
+    if not names:
+        lines.append("// No tables found — nothing to query.")
+        return "\n".join(lines)
+
+    rows = []
+    for name in names:
+        literal = name.replace('"', '""')
+        identifier = name.replace("'", "''")
+        rows.append(f'\tROW("Table", "{literal}", "Rows", COUNTROWS(\'{identifier}\'))')
+
+    lines.append("EVALUATE")
+    lines.append("UNION(")
+    lines.append(",\n".join(rows))
+    lines.append(")")
+    lines.append("ORDER BY [Table]")
+    return "\n".join(lines)
+
+
+def parse_rowcount_file(path: Path) -> dict[str, int]:
+    """Parses a DAX Studio / Power BI Desktop result grid pasted as plain text
+    (tab-, comma-, or semicolon-separated, header included) into {table_name: row_count}.
+    Semicolon is included because Excel's clipboard/CSV list separator is ";" rather
+    than "," on many regional (e.g. Dutch/German) system locales."""
+    text = path.read_text(encoding="utf-8-sig")
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    counts: dict[str, int] = {}
+    if len(lines) < 2:
+        return counts
+
+    if "\t" in lines[0]:
+        delim = "\t"
+    elif ";" in lines[0]:
+        delim = ";"
+    elif "," in lines[0]:
+        delim = ","
+    else:
+        delim = None
+
+    def split(line: str) -> list[str]:
+        cols = line.split(delim) if delim else [line]
+        return [c.strip().strip('"').strip("[]").strip() for c in cols]
+
+    header = [h.lower() for h in split(lines[0])]
+    table_idx = next((i for i, h in enumerate(header) if "table" in h), 0)
+    rows_idx = next((i for i, h in enumerate(header) if "row" in h), len(header) - 1)
+
+    for line in lines[1:]:
+        cols = split(line)
+        if len(cols) <= max(table_idx, rows_idx):
+            continue
+        name = cols[table_idx]
+        digits = re.sub(r"[^\d]", "", cols[rows_idx])
+        if name and digits:
+            counts[name] = int(digits)
+
+    return counts
 
 
 # ---------------------------------------------------------------------------
@@ -1356,6 +1939,22 @@ def main():
             "Generate a plain-text knowledge base optimised for Copilot / ChatGPT "
             "context injection instead of Markdown docs."
         ),
+    )
+    ap.add_argument(
+        "--rowcounts",
+        default="",
+        help=(
+            "Path to a text file with a pasted DAX row-count result (table + row count, "
+            "tab-, comma-, or semicolon-separated, header included) to include per-table row counts "
+            "in the documentation. Get this file by running the query from "
+            "--rowcount-query in Power BI Desktop's DAX query view or DAX Studio and "
+            "pasting the result grid into a text file."
+        ),
+    )
+    ap.add_argument(
+        "--no-rowcount-query",
+        action="store_true",
+        help="Don't write the companion *_rowcount_query.dax helper file (see --rowcounts).",
     )
     args = ap.parse_args()
 
@@ -1415,12 +2014,30 @@ def main():
     tables = parser.tables()
     n_measures = sum(len(parser.get_measures(t)) for t in tables)
 
+    row_counts: dict[str, int] = {}
+    if args.rowcounts:
+        rc_path = Path(args.rowcounts)
+        if rc_path.exists():
+            row_counts = parse_rowcount_file(rc_path)
+            print(f"Loaded row counts for {len(row_counts)} table(s) from: {rc_path}")
+        else:
+            print(f"WARNING: --rowcounts file not found: {rc_path}", file=sys.stderr)
+    elif not args.no_rowcount_query:
+        dax_query = generate_rowcount_query(tables)
+        out_dir = Path(args.output).parent if args.output else Path.cwd()
+        dax_path = out_dir / f"{project_name.replace(' ', '_')}_rowcount_query.dax"
+        dax_path.write_text(dax_query, encoding="utf-8")
+        print(f"Row-count helper query written to: {dax_path.resolve()}")
+        print("  Run it in Power BI Desktop's DAX query view or DAX Studio, paste the")
+        print("  results into a text file, then re-run with --rowcounts <that file> to")
+        print("  include row counts in the documentation.")
+
     if args.copilot:
-        content = render_copilot_kb(project_name, parser, report_data, model_format)
+        content = render_copilot_kb(project_name, parser, report_data, model_format, row_counts)
         default_name = f"{project_name.replace(' ', '_')}_copilot_kb.txt"
         suffix = "Copilot knowledge base"
     else:
-        content = render_markdown(project_name, parser, report_data, model_format)
+        content = render_markdown(project_name, parser, report_data, model_format, row_counts)
         default_name = f"{project_name.replace(' ', '_')}_docs.md"
         suffix = "Markdown documentation"
 
@@ -1432,6 +2049,8 @@ def main():
     print(f"  Tables:        {len(tables)}")
     print(f"  Measures:      {n_measures}")
     print(f"  Relationships: {len(parser.relationships())}")
+    if row_counts:
+        print(f"  Row counts:    {len(row_counts)}/{len(tables)} table(s)")
 
     if args.copilot:
         size_kb = out.stat().st_size / 1024

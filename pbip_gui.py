@@ -29,6 +29,8 @@ def _run_extraction(
     pbip_path: str,
     output_dir: str,
     copilot: bool,
+    rowcounts_path: str,
+    write_rowcount_query: bool,
     log: scrolledtext.ScrolledText,
     run_btn: ttk.Button,
     root: tk.Tk,
@@ -94,13 +96,31 @@ def _run_extraction(
             tables = parser.tables()
             n_measures = sum(len(parser.get_measures(t)) for t in tables)
 
+            row_counts: dict = {}
+            rc_path_str = rowcounts_path.strip()
+            if rc_path_str:
+                rc_path = Path(rc_path_str)
+                if rc_path.exists():
+                    row_counts = pe.parse_rowcount_file(rc_path)
+                    print(f"Loaded row counts for {len(row_counts)} table(s) from: {rc_path}")
+                else:
+                    print(f"WARNING: Row-counts file not found: {rc_path}")
+            elif write_rowcount_query:
+                dax_query = pe.generate_rowcount_query(tables)
+                dax_path = Path(output_dir) / f"{project_name.replace(' ', '_')}_rowcount_query.dax"
+                dax_path.write_text(dax_query, encoding="utf-8")
+                print(f"Row-count helper query written to: {dax_path.resolve()}")
+                print("  Run it in Power BI Desktop's DAX query view or DAX Studio, paste the")
+                print("  results into a text file, then point 'Row counts file' at it and")
+                print("  generate again to include row counts in the documentation.")
+
             filename = _auto_filename(pbip_path, copilot)
             output_path = Path(output_dir) / filename
 
             if copilot:
-                content = pe.render_copilot_kb(project_name, parser, report_data, model_format)
+                content = pe.render_copilot_kb(project_name, parser, report_data, model_format, row_counts)
             else:
-                content = pe.render_markdown(project_name, parser, report_data, model_format)
+                content = pe.render_markdown(project_name, parser, report_data, model_format, row_counts)
 
             output_path.write_text(content, encoding="utf-8")
 
@@ -108,6 +128,8 @@ def _run_extraction(
             print(f"  Tables:        {len(tables)}")
             print(f"  Measures:      {n_measures}")
             print(f"  Relationships: {len(parser.relationships())}")
+            if row_counts:
+                print(f"  Row counts:    {len(row_counts)}/{len(tables)} table(s)")
 
         append("\n--- Done ---\n")
     except Exception as exc:
@@ -161,9 +183,32 @@ def main():
     ttk.Radiobutton(mode_frame, text="Markdown docs", variable=copilot_var, value=False).pack(side="left", padx=8)
     ttk.Radiobutton(mode_frame, text="Copilot knowledge base", variable=copilot_var, value=True).pack(side="left")
 
+    # --- Row counts (optional) ---
+    ttk.Label(frame, text="Row counts file (optional):").grid(row=3, column=0, sticky="w", pady=4)
+    rowcounts_var = tk.StringVar()
+    ttk.Entry(frame, textvariable=rowcounts_var, width=60).grid(row=3, column=1, sticky="ew", padx=6)
+
+    def browse_rowcounts():
+        path = filedialog.askopenfilename(
+            title="Select pasted DAX row-count result (see row-count helper query)",
+        )
+        if path:
+            rowcounts_var.set(path)
+
+    ttk.Button(frame, text="Browse…", command=browse_rowcounts).grid(row=3, column=2, padx=4)
+
+    write_rowcount_query_var = tk.BooleanVar(value=True)
+    ttk.Checkbutton(
+        frame,
+        text="Also write a *_rowcount_query.dax helper file (paste into Power BI Desktop's "
+             "DAX query view or DAX Studio to get row counts, then fill in the field above "
+             "and generate again)",
+        variable=write_rowcount_query_var,
+    ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(0, 6))
+
     # --- Filename preview ---
     preview_var = tk.StringVar(value="Output file: —")
-    ttk.Label(frame, textvariable=preview_var, foreground="gray").grid(row=3, column=0, columnspan=3, sticky="w")
+    ttk.Label(frame, textvariable=preview_var, foreground="gray").grid(row=5, column=0, columnspan=3, sticky="w")
 
     def _update_preview(*_):
         pbip = pbip_var.get().strip()
@@ -182,7 +227,7 @@ def main():
 
     # --- Run button ---
     run_btn = ttk.Button(frame, text="Generate")
-    run_btn.grid(row=4, column=0, columnspan=3, pady=8)
+    run_btn.grid(row=6, column=0, columnspan=3, pady=8)
 
     def on_run():
         pbip = pbip_var.get().strip()
@@ -199,7 +244,11 @@ def main():
         log.configure(state="disabled")
         threading.Thread(
             target=_run_extraction,
-            args=(pbip, out_dir, copilot_var.get(), log, run_btn, root),
+            args=(
+                pbip, out_dir, copilot_var.get(),
+                rowcounts_var.get().strip(), write_rowcount_query_var.get(),
+                log, run_btn, root,
+            ),
             daemon=True,
         ).start()
 
@@ -207,8 +256,8 @@ def main():
 
     # --- Log area ---
     log = scrolledtext.ScrolledText(frame, state="disabled", height=16, wrap="word", font=("Courier", 10))
-    log.grid(row=5, column=0, columnspan=3, sticky="nsew", pady=4)
-    frame.rowconfigure(5, weight=1)
+    log.grid(row=7, column=0, columnspan=3, sticky="nsew", pady=4)
+    frame.rowconfigure(7, weight=1)
 
     root.mainloop()
 
