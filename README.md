@@ -63,6 +63,23 @@ extra ADOMD.NET/XMLA dependency and a running model):
 4. Re-run `pbip_extract.py --rowcounts <that file>` — row counts now show up per table
    and in the overview.
 
+## Data lineage & impact analysis
+
+Both output modes end with a lineage section, built entirely from what's already
+parsed — no extra input needed. For every table it shows:
+
+- **Upstream** — where its data physically comes from: the connector type (Fabric SQL
+  Endpoint, SharePoint, SQL Server, Web, ...), detected from the M-query's function
+  calls, plus the source schema/object name when the query uses the classic
+  `Source{[Schema="...",Item="..."]}` navigation pattern (this schema/object name is
+  not masked — see Sanitisation below — it's normal, non-sensitive source metadata).
+- **Downstream** — what depends on it: calculated columns and measures (anywhere in
+  the model, including on the table itself) whose DAX references this table,
+  relationships it participates in, and which report visuals surface one of its fields.
+
+Use it to answer "where does this table's data come from?" or "what would break if I
+changed this table?" without cross-referencing every other section by hand.
+
 ## Sanitisation
 
 Power Query and DAX text is scanned for organisation-specific infrastructure values
