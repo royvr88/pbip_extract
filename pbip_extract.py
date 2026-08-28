@@ -11,8 +11,8 @@ Output modes:
              answer questions like "how is measure X built?" or "what does column Y mean?"
 
 Usage:
-    python pbip_document.py <path-to-pbip-folder> [--output docs.md]
-    python pbip_document.py <path-to-pbip-folder> --copilot [--output knowledge.txt]
+    python pbip_document.py <path-to-project>.pbip [--output docs.md]
+    python pbip_document.py <path-to-project>.pbip --copilot [--output knowledge.txt]
 
 Requirements: Python 3.8+ (stdlib only, no pip installs needed)
 """
@@ -1889,9 +1889,99 @@ def parse_rowcount_file(path: Path) -> dict[str, int]:
 
 # ---------------------------------------------------------------------------
 # Project discovery
+#
+# A .pbip file and the .pbir file inside its report folder already contain the
+# exact, authoritative references to the report and semantic-model folders
+# (artifacts[].report.path, and datasetReference.byPath/.byConnection). Reading
+# those is faster and more correct than guessing via a directory scan — it can't
+# pick up an unrelated report/model that happens to sit elsewhere in the tree,
+# and it correctly reports a live/remote connection instead of silently finding
+# nothing. The scan-based functions below are kept only as a fallback for
+# projects where those references can't be read for some reason.
 # ---------------------------------------------------------------------------
 
+def find_report_dir_from_pbip(pbip_file: Path) -> Optional[Path]:
+    """Resolves the report folder from the .pbip file's `artifacts` list."""
+    try:
+        data = read_json(pbip_file)
+    except Exception:
+        return None
+    for artifact in data.get("artifacts", []):
+        report = artifact.get("report")
+        if report and report.get("path"):
+            candidate = (pbip_file.parent / report["path"]).resolve()
+            if candidate.is_dir():
+                return candidate
+    return None
+
+
+def find_semantic_model_from_report(report_dir: Path) -> tuple[Optional[Path], str]:
+    """Resolves the semantic model from the report's definition.pbir file.
+
+    Returns (path, "TMDL"/"TMSL") on success, (None, "connection") if the report
+    is bound to a live connection to a remote/published model (nothing local to
+    document), or (None, "") if no usable reference was found (caller should fall
+    back to find_semantic_model()).
+    """
+    pbir_path = report_dir / "definition.pbir"
+    if not pbir_path.exists():
+        return None, ""
+    try:
+        data = read_json(pbir_path)
+    except Exception:
+        return None, ""
+
+    ds_ref = data.get("datasetReference", {})
+    if "byConnection" in ds_ref:
+        return None, "connection"
+
+    rel = ds_ref.get("byPath", {}).get("path", "")
+    if not rel:
+        return None, ""
+
+    model_dir = (report_dir / rel).resolve()
+    if not model_dir.is_dir():
+        return None, ""
+
+    db_tmdl = model_dir / "definition" / "database.tmdl"
+    if db_tmdl.exists():
+        return db_tmdl.parent, "TMDL"
+
+    definition_dir = model_dir / "definition"
+    if definition_dir.is_dir() and any(definition_dir.glob("*.tmdl")):
+        return definition_dir, "TMDL"
+
+    bim_files = list(model_dir.glob("*.bim"))
+    if bim_files:
+        return bim_files[0], "TMSL"
+
+    return None, ""
+
+
+def resolve_report_definition_dir(report_dir: Path) -> Optional[Path]:
+    """Modern report definition folder, given the report folder is already known."""
+    definition_dir = report_dir / "definition"
+    if (definition_dir / "pages" / "pages.json").exists():
+        return definition_dir
+    return None
+
+
+def resolve_report_json(report_dir: Path) -> Optional[Path]:
+    """Legacy report.json, given the report folder is already known."""
+    candidate = report_dir / "report.json"
+    if candidate.exists():
+        try:
+            data = read_json(candidate)
+            if data.get("sections"):
+                return candidate
+        except Exception:
+            pass
+    return None
+
+
 def find_semantic_model(pbip_root: Path) -> tuple[Optional[Path], str]:
+    """Fallback: scans the project folder for a semantic model when the .pbip/.pbir
+    references couldn't be resolved."""
     for candidate in pbip_root.rglob("database.tmdl"):
         return candidate.parent, "TMDL"
 
@@ -1906,6 +1996,7 @@ def find_semantic_model(pbip_root: Path) -> tuple[Optional[Path], str]:
 
 
 def find_report_json(pbip_root: Path) -> Optional[Path]:
+    """Fallback: scans the project folder for a legacy report.json."""
     for candidate in pbip_root.rglob("report.json"):
         try:
             data = read_json(candidate)
@@ -1917,6 +2008,7 @@ def find_report_json(pbip_root: Path) -> Optional[Path]:
 
 
 def find_report_definition_dir(pbip_root: Path) -> Optional[Path]:
+    """Fallback: scans the project folder for a modern report definition folder."""
     for candidate in pbip_root.rglob("pages.json"):
         pages_dir = candidate.parent
         if pages_dir.name == "pages":
@@ -1929,8 +2021,8 @@ def find_report_definition_dir(pbip_root: Path) -> Optional[Path]:
 # ---------------------------------------------------------------------------
 
 def main():
-    ap = argparse.ArgumentParser(description="Document a Power BI .pbip project")
-    ap.add_argument("pbip_path", help="Path to the .pbip project folder")
+    ap = argparse.ArgumentParser(description="Document a Power BI project from its .pbip file")
+    ap.add_argument("pbip_file", help="Path to the .pbip project file (not the project folder)")
     ap.add_argument("--output", "-o", default="", help="Output file path")
     ap.add_argument(
         "--copilot",
@@ -1958,23 +2050,62 @@ def main():
     )
     args = ap.parse_args()
 
-    input_path = Path(args.pbip_path)
-    if input_path.is_absolute():
-        pbip_root = input_path
-    else:
-        pbip_root = Path.cwd() / args.pbip_path.lstrip('/\\')
-    if not pbip_root.exists():
-        print(f"ERROR: Path does not exist: {pbip_root.resolve()}", file=sys.stderr)
+    input_path = Path(args.pbip_file)
+    if not input_path.is_absolute():
+        input_path = Path.cwd() / args.pbip_file.lstrip('/\\')
+
+    if not input_path.exists():
+        print(f"ERROR: Path does not exist: {input_path.resolve()}", file=sys.stderr)
+        sys.exit(1)
+    if input_path.is_dir():
+        guesses = sorted(input_path.glob("*.pbip"))
+        hint = f" Did you mean: {guesses[0].name}?" if guesses else ""
+        print(
+            f"ERROR: Expected a .pbip file, got a folder: {input_path.resolve()}\n"
+            f"       Point this at the *.pbip file inside that folder instead.{hint}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if input_path.suffix.lower() != ".pbip":
+        print(f"ERROR: Expected a .pbip file, got: {input_path.resolve()}", file=sys.stderr)
         sys.exit(1)
 
-    project_name = pbip_root.name.replace(".pbip", "").replace("_", " ").title()
+    pbip_root = input_path.parent
+    project_name = input_path.stem.replace("_", " ").title()
 
-    model_path, model_format = find_semantic_model(pbip_root)
+    # Prefer the exact references from the .pbip/.pbir files; fall back to a
+    # directory scan only if those can't be read (e.g. non-standard project layout).
+    report_dir = find_report_dir_from_pbip(input_path)
+    if report_dir:
+        print(f"Found report artifact (from .pbip): {report_dir}")
+    else:
+        print(
+            "WARNING: Could not read the report artifact reference from the .pbip file; "
+            "falling back to scanning the project folder.",
+            file=sys.stderr,
+        )
+
+    model_path, model_format = (None, "")
+    if report_dir:
+        model_path, model_format = find_semantic_model_from_report(report_dir)
+        if model_format == "connection":
+            print(
+                "ERROR: This report uses a live connection to a remote/published semantic "
+                "model — there is no local semantic model in this project to document.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if model_path:
+            print(f"Found semantic model ({model_format}, via .pbip/.pbir reference): {model_path}")
+
+    if not model_path:
+        model_path, model_format = find_semantic_model(pbip_root)
+        if model_path:
+            print(f"Found semantic model ({model_format}, by scanning the project folder): {model_path}")
+
     if not model_path:
         print("ERROR: No semantic model found (.bim or TMDL definition folder).", file=sys.stderr)
         sys.exit(1)
-
-    print(f"Found semantic model ({model_format}): {model_path}")
 
     if model_format == "TMSL":
         parser = TMSLParser(model_path)
@@ -1983,7 +2114,9 @@ def main():
 
     report_data = None
 
-    report_def_dir = find_report_definition_dir(pbip_root)
+    report_def_dir = resolve_report_definition_dir(report_dir) if report_dir else None
+    if not report_def_dir:
+        report_def_dir = find_report_definition_dir(pbip_root)
     if report_def_dir:
         print(f"Found modern report definition: {report_def_dir}")
         try:
@@ -1992,7 +2125,9 @@ def main():
             print(f"WARNING: Could not parse modern report definition: {e}", file=sys.stderr)
 
     if not report_data or not report_data.get("pages"):
-        report_json_path = find_report_json(pbip_root)
+        report_json_path = resolve_report_json(report_dir) if report_dir else None
+        if not report_json_path:
+            report_json_path = find_report_json(pbip_root)
         if report_json_path:
             print(f"Found legacy report.json: {report_json_path}")
             try:

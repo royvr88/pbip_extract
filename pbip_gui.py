@@ -51,21 +51,45 @@ def _run_extraction(
 
     writer = LogWriter()
     try:
-        pbip_root = Path(pbip_path)
-        project_name = pbip_root.name.replace(".pbip", "").replace("_", " ").title()
+        pbip_file = Path(pbip_path)
+        pbip_root = pbip_file.parent
+        project_name = pbip_file.stem.replace("_", " ").title()
 
         with contextlib.redirect_stdout(writer), contextlib.redirect_stderr(writer):
-            model_path, model_format = pe.find_semantic_model(pbip_root)
+            # Prefer the exact references from the .pbip/.pbir files; fall back to a
+            # directory scan only if those can't be read.
+            report_dir = pe.find_report_dir_from_pbip(pbip_file)
+            if report_dir:
+                print(f"Found report artifact (from .pbip): {report_dir}")
+            else:
+                print("WARNING: Could not read the report artifact reference from the .pbip "
+                      "file; falling back to scanning the project folder.")
+
+            model_path, model_format = (None, "")
+            if report_dir:
+                model_path, model_format = pe.find_semantic_model_from_report(report_dir)
+                if model_format == "connection":
+                    append("ERROR: This report uses a live connection to a remote/published "
+                           "semantic model — there is no local semantic model to document.\n")
+                    return
+                if model_path:
+                    print(f"Found semantic model ({model_format}, via .pbip/.pbir reference): {model_path}")
+
+            if not model_path:
+                model_path, model_format = pe.find_semantic_model(pbip_root)
+                if model_path:
+                    print(f"Found semantic model ({model_format}, by scanning the project folder): {model_path}")
+
             if not model_path:
                 append("ERROR: No semantic model found (.bim or TMDL definition folder).\n")
                 return
 
-            print(f"Found semantic model ({model_format}): {model_path}")
-
             parser = pe.TMSLParser(model_path) if model_format == "TMSL" else pe.TMLDParser(model_path)
 
             report_data = None
-            report_def_dir = pe.find_report_definition_dir(pbip_root)
+            report_def_dir = pe.resolve_report_definition_dir(report_dir) if report_dir else None
+            if not report_def_dir:
+                report_def_dir = pe.find_report_definition_dir(pbip_root)
             if report_def_dir:
                 print(f"Found modern report definition: {report_def_dir}")
                 try:
@@ -74,7 +98,9 @@ def _run_extraction(
                     print(f"WARNING: Could not parse modern report definition: {e}")
 
             if not report_data or not report_data.get("pages"):
-                report_json_path = pe.find_report_json(pbip_root)
+                report_json_path = pe.resolve_report_json(report_dir) if report_dir else None
+                if not report_json_path:
+                    report_json_path = pe.find_report_json(pbip_root)
                 if report_json_path:
                     print(f"Found legacy report.json: {report_json_path}")
                     try:
@@ -149,17 +175,20 @@ def main():
     root.rowconfigure(0, weight=1)
     frame.columnconfigure(1, weight=1)
 
-    # --- PBIP folder ---
-    ttk.Label(frame, text="PBIP folder:").grid(row=0, column=0, sticky="w", pady=4)
+    # --- PBIP file ---
+    ttk.Label(frame, text=".pbip file:").grid(row=0, column=0, sticky="w", pady=4)
     pbip_var = tk.StringVar()
     ttk.Entry(frame, textvariable=pbip_var, width=60).grid(row=0, column=1, sticky="ew", padx=6)
 
     def browse_pbip():
-        path = filedialog.askdirectory(title="Select .pbip project folder")
+        path = filedialog.askopenfilename(
+            title="Select .pbip project file",
+            filetypes=[(".pbip files", "*.pbip"), ("All files", "*.*")],
+        )
         if path:
             pbip_var.set(path)
             if not output_dir_var.get():
-                output_dir_var.set(path)
+                output_dir_var.set(str(Path(path).parent))
 
     ttk.Button(frame, text="Browse…", command=browse_pbip).grid(row=0, column=2, padx=4)
 
@@ -232,7 +261,10 @@ def main():
     def on_run():
         pbip = pbip_var.get().strip()
         if not pbip:
-            messagebox.showwarning("Missing input", "Please select a PBIP folder first.")
+            messagebox.showwarning("Missing input", "Please select a .pbip file first.")
+            return
+        if not pbip.lower().endswith(".pbip"):
+            messagebox.showwarning("Invalid input", "Please select a .pbip file (not a folder).")
             return
         out_dir = output_dir_var.get().strip()
         if not out_dir:

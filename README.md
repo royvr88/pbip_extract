@@ -1,6 +1,6 @@
 # pbip_extract
 
-A command-line tool that generates documentation from a Power BI Project (`.pbip`) folder.
+A command-line tool that generates documentation from a Power BI Project (`.pbip`) file.
 
 Supports both **TMSL** (`.bim`) and **TMDL** (`.tmdl`) semantic model formats.
 
@@ -18,33 +18,44 @@ Supports both **TMSL** (`.bim`) and **TMDL** (`.tmdl`) semantic model formats.
 
 ## Usage
 
-The path can be absolute or relative to the directory you run the script from:
+Point the script at the **`.pbip` file itself** (not the project folder). The path can be
+absolute or relative to the directory you run the script from:
 
 ```bash
 # Absolute path
-python pbip_extract.py "C:\Users\you\Documents\MyReport"
+python pbip_extract.py "C:\Users\you\Documents\MyReport\MyReport.pbip"
 
 # Relative path (resolved from current directory)
-python pbip_extract.py MyReport
-python pbip_extract.py ./MyReport
+python pbip_extract.py MyReport/MyReport.pbip
+python pbip_extract.py ./MyReport/MyReport.pbip
 ```
 
 ```bash
 # Markdown docs
-python pbip_extract.py <path-to-pbip-folder>
+python pbip_extract.py <path-to-project>.pbip
 
 # Write to a specific file
-python pbip_extract.py <path-to-pbip-folder> --output docs.md
+python pbip_extract.py <path-to-project>.pbip --output docs.md
 
 # LLM knowledge base
-python pbip_extract.py <path-to-pbip-folder> --copilot
+python pbip_extract.py <path-to-project>.pbip --copilot
 
 # LLM knowledge base to a specific file
-python pbip_extract.py <path-to-pbip-folder> --copilot --output knowledge.txt
+python pbip_extract.py <path-to-project>.pbip --copilot --output knowledge.txt
 
 # Include per-table row counts (see "Row counts" below)
-python pbip_extract.py <path-to-pbip-folder> --rowcounts rowcounts.txt
+python pbip_extract.py <path-to-project>.pbip --rowcounts rowcounts.txt
 ```
+
+Passing the project *folder* instead of the `.pbip` file gives a clear error (with a
+suggestion, if there's exactly one `.pbip` file in that folder) rather than silently
+guessing. This is deliberate: the `.pbip` file's `artifacts` list, and the
+`definition.pbir` file inside its report folder, already contain the exact, authoritative
+reference to which report and which semantic model belong together — reading those is
+more correct than scanning the folder tree for *some* report and *some* model, which can
+pick up the wrong one in a folder containing more than one PBIP project. A report bound
+to a live connection to a remote/published model (no local semantic model in the project)
+is also reported clearly instead of failing with "not found".
 
 ## Row counts
 
