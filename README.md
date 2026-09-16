@@ -55,7 +55,9 @@ reference to which report and which semantic model belong together — reading t
 more correct than scanning the folder tree for *some* report and *some* model, which can
 pick up the wrong one in a folder containing more than one PBIP project. A report bound
 to a live connection to a remote/published model (no local semantic model in the project)
-is also reported clearly instead of failing with "not found".
+is also detected explicitly instead of failing with "not found" — since there's nothing
+local to document, the output in that case is just the report structure (pages and
+visuals), skipping the semantic-model sections entirely.
 
 ## Row counts
 

@@ -65,27 +65,6 @@ def _run_extraction(
                 print("WARNING: Could not read the report artifact reference from the .pbip "
                       "file; falling back to scanning the project folder.")
 
-            model_path, model_format = (None, "")
-            if report_dir:
-                model_path, model_format = pe.find_semantic_model_from_report(report_dir)
-                if model_format == "connection":
-                    append("ERROR: This report uses a live connection to a remote/published "
-                           "semantic model — there is no local semantic model to document.\n")
-                    return
-                if model_path:
-                    print(f"Found semantic model ({model_format}, via .pbip/.pbir reference): {model_path}")
-
-            if not model_path:
-                model_path, model_format = pe.find_semantic_model(pbip_root)
-                if model_path:
-                    print(f"Found semantic model ({model_format}, by scanning the project folder): {model_path}")
-
-            if not model_path:
-                append("ERROR: No semantic model found (.bim or TMDL definition folder).\n")
-                return
-
-            parser = pe.TMSLParser(model_path) if model_format == "TMSL" else pe.TMLDParser(model_path)
-
             report_data = None
             report_def_dir = pe.resolve_report_definition_dir(report_dir) if report_dir else None
             if not report_def_dir:
@@ -118,6 +97,44 @@ def _run_extraction(
                     for v in p.get("visuals", [])
                 )
                 print(f"  Pages: {len(report_data['pages'])}, Visuals: {total_visuals}, Field bindings: {total_fields}")
+
+            model_path, model_format = (None, "")
+            if report_dir:
+                model_path, model_format = pe.find_semantic_model_from_report(report_dir)
+                if model_path:
+                    print(f"Found semantic model ({model_format}, via .pbip/.pbir reference): {model_path}")
+
+            if not model_path and model_format != "connection":
+                model_path, model_format = pe.find_semantic_model(pbip_root)
+                if model_path:
+                    print(f"Found semantic model ({model_format}, by scanning the project folder): {model_path}")
+
+            if model_format == "connection":
+                print("This report uses a live connection to a remote/published semantic "
+                      "model — there is no local semantic model to document. Writing the "
+                      "report structure (pages and visuals) only.")
+
+                filename = _auto_filename(pbip_path, copilot)
+                output_path = Path(output_dir) / filename
+                if copilot:
+                    content = pe.render_report_only_copilot_kb(project_name, report_data)
+                else:
+                    content = pe.render_report_only_markdown(project_name, report_data)
+                output_path.write_text(content, encoding="utf-8")
+
+                print(f"\nDone. Written to: {output_path.resolve()}")
+                if report_data and report_data.get("pages"):
+                    print(f"  Pages:   {len(report_data['pages'])}")
+                    print(f"  Visuals: {sum(len(p.get('visuals', [])) for p in report_data['pages'])}")
+
+                append("\n--- Done ---\n")
+                return
+
+            if not model_path:
+                append("ERROR: No semantic model found (.bim or TMDL definition folder).\n")
+                return
+
+            parser = pe.TMSLParser(model_path) if model_format == "TMSL" else pe.TMLDParser(model_path)
 
             tables = parser.tables()
             n_measures = sum(len(parser.get_measures(t)) for t in tables)

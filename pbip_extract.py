@@ -834,6 +834,148 @@ def parse_report_definition(definition_dir: Path) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Report structure (pages & visuals) — shared between the full renderers and
+# the report-only renderers used when a report has no local semantic model
+# (live connection to a remote/published model).
+# ---------------------------------------------------------------------------
+
+def _report_structure_markdown_lines(report_data: dict) -> list[str]:
+    lines: list[str] = []
+    def p(t=""): lines.append(t)
+    def h3(t): lines.extend([f"### {t}", ""])
+
+    pages = report_data.get("pages", [])
+    p(f"Total pages: **{len(pages)}**")
+    p()
+    for page in pages:
+        h3(page["name"])
+        visuals = page.get("visuals", [])
+        if not visuals:
+            p("_No visual information extracted._")
+            p()
+            continue
+
+        type_counts = Counter(v["visualType"] for v in visuals)
+        p(f"**{len(visuals)} visual(s):** " + ", ".join(f"{cnt}× {vt}" for vt, cnt in sorted(type_counts.items())))
+        p()
+
+        for i, visual in enumerate(visuals, 1):
+            vtype = visual["visualType"]
+            title = visual.get("title", "")
+            fields = visual.get("fields", [])
+
+            header = f"**Visual {i}: `{vtype}`**"
+            if title:
+                header += f" — _{title}_"
+            p(header)
+
+            if fields:
+                p("| Role | Field | Display Name |")
+                p("|------|-------|--------------|")
+                for f in fields:
+                    role = f.get("role", "")
+                    field = f.get("field", "")
+                    display = f.get("displayName", "")
+                    p(f"| {role} | `{field}` | {display} |")
+            else:
+                p("_No field bindings extracted._")
+            p()
+
+    return lines
+
+
+def _report_structure_copilot_lines(report_data: dict) -> list[str]:
+    lines: list[str] = []
+    def w(s=""): lines.append(s)
+
+    pages = report_data.get("pages", [])
+    w(f"The report has {len(pages)} page(s).")
+    w()
+    for page in pages:
+        page_name = page["name"]
+        visuals = page.get("visuals", [])
+        w(f"Page: {page_name} ({len(visuals)} visual(s))")
+        w("-" * 60)
+
+        if not visuals:
+            w("  No visual information available.")
+            w()
+            continue
+
+        for i, visual in enumerate(visuals, 1):
+            vtype = visual["visualType"]
+            title = visual.get("title", "")
+            fields = visual.get("fields", [])
+
+            label = f'Visual {i}: {vtype}'
+            if title:
+                label += f' (title: "{title}")'
+            w(f"  {label}")
+
+            if fields:
+                for f in fields:
+                    role = f.get("role", "")
+                    field = f.get("field", "")
+                    display = f.get("displayName", "")
+                    role_str = f" [{role}]" if role else ""
+                    display_str = f' (shown as "{display}")' if display and display != field else ""
+                    w(f"    - {field}{role_str}{display_str}")
+            else:
+                w("    No field bindings extracted.")
+            w()
+
+    return lines
+
+
+def render_report_only_markdown(project_name: str, report_data: Optional[dict]) -> str:
+    """Report-only documentation for a report bound to a live connection to a
+    remote/published semantic model: no local model to document, so this is
+    just the pages/visuals overview."""
+    lines: list[str] = []
+    def h1(t): lines.extend([f"# {t}", ""])
+    def h2(t): lines.extend([f"## {t}", ""])
+    def p(t=""): lines.append(t)
+
+    h1(f"Power BI Documentation: {project_name}")
+    p("_This report uses a live connection to a remote/published semantic model — "
+      "there is no local semantic model in this project to document. Only the "
+      "report structure (pages and visuals) below was extracted._")
+    p()
+
+    h2("Report Structure")
+    if report_data and report_data.get("pages"):
+        lines.extend(_report_structure_markdown_lines(report_data))
+    else:
+        p("_No report structure could be extracted._")
+        p()
+
+    return "\n".join(lines)
+
+
+def render_report_only_copilot_kb(project_name: str, report_data: Optional[dict]) -> str:
+    """Copilot-mode counterpart to render_report_only_markdown."""
+    lines: list[str] = []
+    def w(s=""): lines.append(s)
+
+    w("=" * 80)
+    w(f"POWER BI REPORT OVERVIEW: {project_name.upper()}")
+    w("=" * 80)
+    w()
+    w("This report uses a live connection to a remote/published semantic model.")
+    w("There is no local semantic model in this project to document, so this file")
+    w("only lists the report's pages and visuals (and the fields each visual uses).")
+    w()
+
+    if report_data and report_data.get("pages"):
+        lines.extend(_report_structure_copilot_lines(report_data))
+    else:
+        w("No report structure could be extracted.")
+        w()
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Markdown renderer
 # ---------------------------------------------------------------------------
 
@@ -1037,42 +1179,7 @@ def render_markdown(
 
     if report_data:
         h2("Report Structure")
-        pages = report_data.get("pages", [])
-        p(f"Total pages: **{len(pages)}**")
-        p()
-        for page in pages:
-            h3(page["name"])
-            visuals = page.get("visuals", [])
-            if not visuals:
-                p("_No visual information extracted._")
-                p()
-                continue
-
-            type_counts = Counter(v["visualType"] for v in visuals)
-            p(f"**{len(visuals)} visual(s):** " + ", ".join(f"{cnt}× {vt}" for vt, cnt in sorted(type_counts.items())))
-            p()
-
-            for i, visual in enumerate(visuals, 1):
-                vtype = visual["visualType"]
-                title = visual.get("title", "")
-                fields = visual.get("fields", [])
-
-                header = f"**Visual {i}: `{vtype}`**"
-                if title:
-                    header += f" — _{title}_"
-                p(header)
-
-                if fields:
-                    p("| Role | Field | Display Name |")
-                    p("|------|-------|--------------|")
-                    for f in fields:
-                        role = f.get("role", "")
-                        field = f.get("field", "")
-                        display = f.get("displayName", "")
-                        p(f"| {role} | `{field}` | {display} |")
-                else:
-                    p("_No field bindings extracted._")
-                p()
+        lines.extend(_report_structure_markdown_lines(report_data))
 
     h2("Power Query (M) Sources")
     has_pq = False
@@ -1658,41 +1765,7 @@ def render_copilot_kb(
         w("SECTION 5: REPORT STRUCTURE AND VISUAL FIELD BINDINGS")
         w("=" * 80)
         w()
-        pages = report_data.get("pages", [])
-        w(f"The report has {len(pages)} page(s).")
-        w()
-        for page in pages:
-            page_name = page["name"]
-            visuals = page.get("visuals", [])
-            w(f"Page: {page_name} ({len(visuals)} visual(s))")
-            w("-" * 60)
-
-            if not visuals:
-                w("  No visual information available.")
-                w()
-                continue
-
-            for i, visual in enumerate(visuals, 1):
-                vtype = visual["visualType"]
-                title = visual.get("title", "")
-                fields = visual.get("fields", [])
-
-                label = f'Visual {i}: {vtype}'
-                if title:
-                    label += f' (title: "{title}")'
-                w(f"  {label}")
-
-                if fields:
-                    for f in fields:
-                        role = f.get("role", "")
-                        field = f.get("field", "")
-                        display = f.get("displayName", "")
-                        role_str = f" [{role}]" if role else ""
-                        display_str = f' (shown as "{display}")' if display and display != field else ""
-                        w(f"    - {field}{role_str}{display_str}")
-                else:
-                    w("    No field bindings extracted.")
-                w()
+        lines.extend(_report_structure_copilot_lines(report_data))
 
     w("=" * 80)
     w("SECTION 6: POWER QUERY (M) SOURCES")
@@ -2085,33 +2158,6 @@ def main():
             file=sys.stderr,
         )
 
-    model_path, model_format = (None, "")
-    if report_dir:
-        model_path, model_format = find_semantic_model_from_report(report_dir)
-        if model_format == "connection":
-            print(
-                "ERROR: This report uses a live connection to a remote/published semantic "
-                "model — there is no local semantic model in this project to document.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        if model_path:
-            print(f"Found semantic model ({model_format}, via .pbip/.pbir reference): {model_path}")
-
-    if not model_path:
-        model_path, model_format = find_semantic_model(pbip_root)
-        if model_path:
-            print(f"Found semantic model ({model_format}, by scanning the project folder): {model_path}")
-
-    if not model_path:
-        print("ERROR: No semantic model found (.bim or TMDL definition folder).", file=sys.stderr)
-        sys.exit(1)
-
-    if model_format == "TMSL":
-        parser = TMSLParser(model_path)
-    else:
-        parser = TMLDParser(model_path)
-
     report_data = None
 
     report_def_dir = resolve_report_definition_dir(report_dir) if report_dir else None
@@ -2145,6 +2191,55 @@ def main():
             for v in p.get("visuals", [])
         )
         print(f"  Pages: {len(report_data['pages'])}, Visuals: {total_visuals}, Field bindings: {total_fields}")
+
+    model_path, model_format = (None, "")
+    if report_dir:
+        model_path, model_format = find_semantic_model_from_report(report_dir)
+        if model_path:
+            print(f"Found semantic model ({model_format}, via .pbip/.pbir reference): {model_path}")
+
+    if not model_path and model_format != "connection":
+        model_path, model_format = find_semantic_model(pbip_root)
+        if model_path:
+            print(f"Found semantic model ({model_format}, by scanning the project folder): {model_path}")
+
+    if model_format == "connection":
+        # No local semantic model to document (report is bound to a live connection
+        # to a remote/published model) — write just the report structure instead of
+        # failing outright.
+        print(
+            "This report uses a live connection to a remote/published semantic model "
+            "— there is no local semantic model to document. Writing the report "
+            "structure (pages and visuals) only."
+        )
+
+        if args.copilot:
+            content = render_report_only_copilot_kb(project_name, report_data)
+            default_name = f"{project_name.replace(' ', '_')}_copilot_kb.txt"
+            suffix = "Copilot knowledge base"
+        else:
+            content = render_report_only_markdown(project_name, report_data)
+            default_name = f"{project_name.replace(' ', '_')}_docs.md"
+            suffix = "Markdown documentation"
+
+        output_path = args.output or default_name
+        out = Path(output_path)
+        out.write_text(content, encoding="utf-8")
+
+        print(f"\nDone. {suffix} written to: {out.resolve()}")
+        if report_data and report_data.get("pages"):
+            print(f"  Pages:   {len(report_data['pages'])}")
+            print(f"  Visuals: {sum(len(p.get('visuals', [])) for p in report_data['pages'])}")
+        return
+
+    if not model_path:
+        print("ERROR: No semantic model found (.bim or TMDL definition folder).", file=sys.stderr)
+        sys.exit(1)
+
+    if model_format == "TMSL":
+        parser = TMSLParser(model_path)
+    else:
+        parser = TMLDParser(model_path)
 
     tables = parser.tables()
     n_measures = sum(len(parser.get_measures(t)) for t in tables)
