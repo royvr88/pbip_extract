@@ -1,161 +1,79 @@
 # pbip_extract
 
-A command-line tool that generates documentation from a Power BI Project (`.pbip`) file.
-
-Supports both **TMSL** (`.bim`) and **TMDL** (`.tmdl`) semantic model formats.
-
-## Output modes
-
-| Mode | Description |
-|------|-------------|
-| Default | Markdown documentation — tables, columns, measures, relationships, RLS roles, report pages |
-| `--copilot` | Plain-text knowledge base for LLM context injection (Copilot for M365, ChatGPT, Claude) |
+Generates one Markdown document from a Power BI Project (`.pbip`): what the report
+looks like and how the semantic model behind it is built. Useful as documentation and
+as a knowledge file for an AI assistant (Copilot, Claude, ChatGPT).
 
 ## Requirements
 
-- Python 3.8+
-- No external dependencies (stdlib only)
+- Python 3.8 or newer, standard library only (nothing to `pip install`)
+- Works on Windows, macOS and Linux
 
 ## Usage
 
-Point the script at the **`.pbip` file itself** (not the project folder). The path can be
-absolute or relative to the directory you run the script from:
-
-```bash
-# Absolute path
-python pbip_extract.py "C:\Users\you\Documents\MyReport\MyReport.pbip"
-
-# Relative path (resolved from current directory)
-python pbip_extract.py MyReport/MyReport.pbip
-python pbip_extract.py ./MyReport/MyReport.pbip
+```
+python pbip_extract.py "C:\Reports\MyReport\MyReport.pbip"
+python pbip_extract.py MyReport.pbip -o docs.md
+python pbip_extract.py MyReport.pbip --rowcounts rowcounts.txt
+python pbip_gui.py          (same thing with a small window; double-click on Windows)
 ```
 
-```bash
-# Markdown docs
-python pbip_extract.py <path-to-project>.pbip
+| Option | Meaning |
+|---|---|
+| `pbip_file` | The `.pbip` file, or a folder that contains exactly one |
+| `-o, --output` | Output file or folder. Default: `<project>_docs.md` in the current folder |
+| `--rowcounts FILE` | Add row counts per table (see below) |
+| `--no-rowcount-query` | Don't write the `<project>_rowcount_query.dax` helper |
+| `--copilot` | Same content, but the default file name is `<project>_copilot_kb.txt` |
 
-# Write to a specific file
-python pbip_extract.py <path-to-project>.pbip --output docs.md
+The report and model folders are found through the references in the `.pbip` file and
+the report's `definition.pbir`, so a folder with several projects is never mixed up.
+A report with a live connection to a published model has no local model; then only
+the report is documented.
 
-# LLM knowledge base
-python pbip_extract.py <path-to-project>.pbip --copilot
+## What is extracted
 
-# LLM knowledge base to a specific file
-python pbip_extract.py <path-to-project>.pbip --copilot --output knowledge.txt
+**Report** (PBIR folder format and the older single `report.json`)
+- Pages in display order, canvas size, hidden / tooltip / drillthrough pages, background image, theme, bookmarks
+- Per visual: type, title and subtitle, position and size, fields per role (with renamed
+  display names), sort order, fields used in conditional formatting or labels
+- Text of text boxes (including links), button icons and actions, images, shapes, tooltip pages
+- Slicers: style (dropdown, list, ...), single select, default selection
+- Filters from the filter pane on all three levels: all pages, page, and visual, with the
+  condition written out (`Productenmapping[code] = "100211"`, `Kalender[Date] = this year`)
 
-# Include per-table row counts (see "Row counts" below)
-python pbip_extract.py <path-to-project>.pbip --rowcounts rowcounts.txt
-```
-
-Passing the project *folder* instead of the `.pbip` file gives a clear error (with a
-suggestion, if there's exactly one `.pbip` file in that folder) rather than silently
-guessing. This is deliberate: the `.pbip` file's `artifacts` list, and the
-`definition.pbir` file inside its report folder, already contain the exact, authoritative
-reference to which report and which semantic model belong together — reading those is
-more correct than scanning the folder tree for *some* report and *some* model, which can
-pick up the wrong one in a folder containing more than one PBIP project. A report bound
-to a live connection to a remote/published model (no local semantic model in the project)
-is also detected explicitly instead of failing with "not found" — since there's nothing
-local to document, the output in that case is just the report structure (pages and
-visuals), skipping the semantic-model sections entirely.
-
-## Row counts
-
-The `.pbip` project files only describe the data **model** (tables, columns, M/DAX) —
-the actual loaded data lives in the Analysis Services engine behind an open Power BI
-Desktop file, not in anything checked into git. So getting a real row count per table
-needs a small manual round-trip instead of a live connection (which would require an
-extra ADOMD.NET/XMLA dependency and a running model):
-
-1. Run `pbip_extract.py` as usual. Alongside the documentation it writes a
-   `<project>_rowcount_query.dax` helper file (unless `--no-rowcount-query` is passed).
-2. Open the `.pbip` project in Power BI Desktop (model must be loaded) and go to
-   **View > DAX query view** — or use DAX Studio. Paste in the generated query and run it.
-3. Select all results (Ctrl+A), copy (Ctrl+C), and paste them into a plain text file
-   (keep the header row).
-4. Re-run `pbip_extract.py --rowcounts <that file>` — row counts now show up per table
-   and in the overview.
-
-## Data lineage & impact analysis
-
-Both output modes end with a lineage section, built entirely from what's already
-parsed — no extra input needed. For every table it shows:
-
-- **Upstream** — where its data physically comes from: the connector type (Fabric SQL
-  Endpoint, SharePoint, SQL Server, Web, ...), detected from the M-query's function
-  calls, plus the source schema/object name when the query uses the classic
-  `Source{[Schema="...",Item="..."]}` navigation pattern (this schema/object name is
-  not masked — see Sanitisation below — it's normal, non-sensitive source metadata).
-- **Downstream** — what depends on it: calculated columns and measures (anywhere in
-  the model, including on the table itself) whose DAX references this table,
-  relationships it participates in, and which report visuals surface one of its fields.
-
-Use it to answer "where does this table's data come from?" or "what would break if I
-changed this table?" without cross-referencing every other section by hand.
+**Semantic model** (TMDL and `.bim`)
+- Tables (hidden ones are marked), columns, descriptions, hierarchies, calculated columns and tables
+- Measures with DAX, format, display folder, the measures and columns they use, and where they are used in the report
+- Relationships, row-level security roles and their filter expressions
+- Per table: where the data comes from, the Power Query (M) code, what refers to it and on which pages it is used
+- Shared Power Query expressions (query parameters are left out on purpose)
 
 ## Sanitisation
 
-Power Query and DAX text is scanned for organisation-specific infrastructure values
-before it's written out, and those values are replaced with a placeholder — the query
-structure itself (functions, applied steps, column references) is always kept intact:
+Organisation-specific values in Power Query and DAX are replaced by a placeholder; the
+query structure itself stays intact.
 
-| Found in the query | Replaced with |
+| Found | Replaced with |
 |---|---|
-| SharePoint site URL | `https://[TENANT].sharepoint.com/sites/[SITE]/...` (path/filename kept) |
-| Fabric SQL analytics endpoint hostname | `[FABRIC_SQL_ENDPOINT]` |
-| `workspaceId` / `groupId` value | `[WORKSPACE_ID]` |
-| `lakehouseId` value | `[LAKEHOUSE_ID]` |
-| `warehouseId` value | `[WAREHOUSE_ID]` |
-| `datasetId` value | `[DATASET_ID]` |
-| `driveId` / `itemId` / `siteId` value | `[SHAREPOINT_DRIVE_ID]` / `[SHAREPOINT_ITEM_ID]` / `[SHAREPOINT_SITE_ID]` |
-| standalone `schema = "..."` assignment | `[SCHEMA]` (the common `[Schema="dbo",Item=...]` navigation field used by classic SQL connectors is left alone — it's not sensitive) |
+| SharePoint site URL | `https://[TENANT].sharepoint.com/sites/[SITE]/...` (path kept) |
+| Fabric SQL endpoint host name | `[FABRIC_SQL_ENDPOINT]` |
+| Power BI workspace in a `powerbi://` URL | `[WORKSPACE]` |
+| `workspaceId`, `groupId`, `lakehouseId`, `warehouseId`, `datasetId`, `driveId`, `itemId`, `siteId` values | `[WORKSPACE_ID]`, `[LAKEHOUSE_ID]`, ... |
+| `schema = "..."` on its own line | `[SCHEMA]` (`[Schema="dbo",Item=...]` navigation is kept) |
 
-Query **parameters** (`expressions.tmdl` entries with `IsParameterQuery=true`) are excluded
-from the documentation entirely rather than masked, since knowing a parameter merely
-exists is rarely useful on its own — see "Shared Power Query functions" below.
+Text on the report canvas (text boxes, titles) is copied as is.
 
-## What gets extracted
+## Row counts
 
-**Semantic model**
-- All tables with columns (name, data type, description) — including full DAX formulas for calculated columns
-- All DAX measures with full expressions
-- Relationships (cardinality, cross-filter direction)
-- Row-Level Security (RLS) roles and filter expressions
-- Power Query (M) partition expressions per table
-- Shared Power Query functions (`expressions.tmdl`) — query **parameters are deliberately excluded**, since they often carry organisation-specific default values (server names, environments, connection info)
+The project files contain no data, so row counts need one manual round trip:
 
-**Report**
-- Report pages and visual types
+1. Run the script. It also writes `<project>_rowcount_query.dax`.
+2. Open the project in Power BI Desktop, go to **DAX query view** (or use DAX Studio) and run that query.
+3. Copy the result grid including the header into a text file.
+4. Run the script again with `--rowcounts <that file>`.
 
-## Copilot / LLM mode
+## Windows note
 
-The `--copilot` flag generates a structured plain-text file optimised for AI assistants. Each measure includes:
-
-- A plain-English description based on the top-level DAX function
-- The full DAX formula
-- Referenced columns, tables, and dependent measures
-
-Upload the output to Copilot for Microsoft 365, paste it into a Claude Project, or use it as a system prompt prefix for a Copilot Studio bot.
-
-## Supported project layouts
-
-```
-MyReport/
-├── MyReport.SemanticModel/
-│   └── definition/          # TMDL layout (Fabric / modern PBIP)
-│       ├── database.tmdl
-│       ├── tables/
-│       ├── relationships.tmdl
-│       ├── roles/
-│       └── expressions.tmdl
-└── MyReport.Report/
-    └── report.json
-
-MyReport/
-└── SemanticModel/
-    └── model.bim             # TMSL layout (classic PBIP)
-```
-
-## Roadmap
-- GUI-ondersteuning voor gebruiksvriendelijke invoer
-- Visuele rapportage in de kennisbank
+Report folders are deeply nested. If Windows reports "path not found" for a project in a
+long folder path, move the project to a shorter path or enable long paths in Windows.
